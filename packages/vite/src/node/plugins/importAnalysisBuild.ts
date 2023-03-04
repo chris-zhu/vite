@@ -19,6 +19,7 @@ import type { ResolvedConfig } from '../config'
 import { toOutputFilePathInJS } from '../build'
 import { genSourceMapUrl } from '../server/sourcemap'
 import { getDepsOptimizer, optimizedDepNeedsInterop } from '../optimizer'
+import { SPECIAL_QUERY_RE } from '../constants'
 import { isCSSRequest, removedPureCssFilesCache } from './css'
 import { interopNamedImports } from './importAnalysis'
 
@@ -165,7 +166,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
       // The importerUrl is passed as third parameter to __vitePreload in this case
       `function(dep, importerUrl) { return new URL(dep, importerUrl).href }`
     : // If the base isn't relative, then the deps are relative to the projects `outDir` and the base
-      // is appendended inside __vitePreload too.
+      // is appended inside __vitePreload too.
       `function(dep) { return ${JSON.stringify(config.base)}+dep }`
   const preloadCode = `const scriptRel = ${scriptRel};const assetsURL = ${assetsURL};const seen = {};export const ${preloadMethod} = ${preload.toString()}`
 
@@ -362,6 +363,8 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
           (source.slice(expStart, start).includes('from') || isDynamicImport) &&
           // already has ?used query (by import.meta.glob)
           !specifier.match(/\?used(&|$)/) &&
+          // don't append ?used when SPECIAL_QUERY_RE exists
+          !specifier.match(SPECIAL_QUERY_RE) &&
           // edge case for package names ending with .css (e.g normalize.css)
           !(bareImportRE.test(specifier) && !specifier.includes('/'))
         ) {
@@ -475,7 +478,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
                     chunk.imports.forEach(addDeps)
                     // Ensure that the css imported by current chunk is loaded after the dependencies.
                     // So the style of current chunk won't be overwritten unexpectedly.
-                    chunk.viteMetadata.importedCss.forEach((file) => {
+                    chunk.viteMetadata!.importedCss.forEach((file) => {
                       deps.add(file)
                     })
                   } else {
@@ -483,8 +486,8 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
                       removedPureCssFilesCache.get(config)!
                     const chunk = removedPureCssFiles.get(filename)
                     if (chunk) {
-                      if (chunk.viteMetadata.importedCss.size) {
-                        chunk.viteMetadata.importedCss.forEach((file) => {
+                      if (chunk.viteMetadata!.importedCss.size) {
+                        chunk.viteMetadata!.importedCss.forEach((file) => {
                           deps.add(file)
                         })
                         hasRemovedPureCssChunk = true

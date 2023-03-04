@@ -18,7 +18,6 @@ import {
   createFilter,
   ensureWatchedFile,
   generateCodeFrame,
-  toUpperCaseDriveLetter,
 } from '../utils'
 import type { ResolvedConfig, ViteDevServer } from '..'
 import type { Plugin } from '../plugin'
@@ -27,9 +26,9 @@ import { searchForWorkspaceRoot } from '..'
 const debug = createDebugger('vite:esbuild')
 
 const INJECT_HELPERS_IIFE_RE =
-  /^(.*?)((?:const|var) \S+=function\([^)]*\)\{"use strict";)/s
+  /^(.*?)((?:const|var)\s+\S+\s*=\s*function\s*\([^)]*\)\s*\{.*?"use strict";)/s
 const INJECT_HELPERS_UMD_RE =
-  /^(.*?)(\(function\([^)]*\)\{.+amd.+function\([^)]*\)\{"use strict";)/s
+  /^(.*?)(\(function\([^)]*\)\s*\{.+?amd.+?function\([^)]*\)\s*\{.*?"use strict";)/s
 
 let server: ViteDevServer
 
@@ -191,9 +190,6 @@ export async function transformWithEsbuild(
         resolvedOptions.sourcemap && resolvedOptions.sourcemap !== 'inline'
           ? JSON.parse(result.map)
           : { mappings: '' }
-    }
-    if (Array.isArray(map.sources)) {
-      map.sources = map.sources.map((it) => toUpperCaseDriveLetter(it))
     }
     return {
       ...result,
@@ -485,6 +481,8 @@ async function loadTsconfigJsonForFile(
 }
 
 function reloadOnTsconfigChange(changedFile: string) {
+  // server could be closed externally after a file change is detected
+  if (!server) return
   // any tsconfig.json that's added in the workspace could be closer to a code file than a previously cached one
   // any json file in the tsconfig cache could have been used to compile ts
   if (

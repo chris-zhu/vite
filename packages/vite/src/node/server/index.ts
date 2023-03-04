@@ -34,13 +34,14 @@ import { cjsSsrResolveExternals } from '../ssr/ssrExternal'
 import { ssrFixStacktrace, ssrRewriteStacktrace } from '../ssr/ssrStacktrace'
 import { ssrTransform } from '../ssr/ssrTransform'
 import {
+  cleanupDepsCacheStaleDirs,
   getDepsOptimizer,
   initDepsOptimizer,
   initDevSsrDepsOptimizer,
 } from '../optimizer'
 import { bindShortcuts } from '../shortcuts'
 import type { BindShortcutsOptions } from '../shortcuts'
-import { CLIENT_DIR } from '../constants'
+import { CLIENT_DIR, DEFAULT_DEV_PORT } from '../constants'
 import type { Logger } from '../logger'
 import { printServerUrls } from '../logger'
 import { invalidatePackageData } from '../packages'
@@ -73,7 +74,7 @@ import {
   handleHMRUpdate,
   updateModules,
 } from './hmr'
-import { openBrowser } from './openBrowser'
+import { openBrowser as _openBrowser } from './openBrowser'
 import type { TransformOptions, TransformResult } from './transformRequest'
 import { transformRequest } from './transformRequest'
 import { searchForWorkspaceRoot } from './searchRoot'
@@ -92,6 +93,7 @@ export interface ServerOptions extends CommonServerOptions {
   watch?: WatchOptions
   /**
    * Create Vite dev server to be used as a middleware in an existing server
+   * @default false
    */
   middlewareMode?: boolean | 'html' | 'ssr'
   /**
@@ -115,6 +117,17 @@ export interface ServerOptions extends CommonServerOptions {
    */
   preTransformRequests?: boolean
   /**
+   * Whether or not to ignore-list source files in the dev server sourcemap, used to populate
+   * the [`x_google_ignoreList` source map extension](https://developer.chrome.com/blog/devtools-better-angular-debugging/#the-x_google_ignorelist-source-map-extension).
+   *
+   * By default, it excludes all paths containing `node_modules`. You can pass `false` to
+   * disable this behavior, or, for full control, a function that takes the source path and
+   * sourcemap path and returns whether to ignore the source path.
+   */
+  sourcemapIgnoreList?:
+    | false
+    | ((sourcePath: string, sourcemapPath: string) => boolean)
+  /**
    * Force dep pre-optimization regardless of whether deps have changed.
    *
    * @deprecated Use optimizeDeps.force instead, this option may be removed
@@ -126,6 +139,10 @@ export interface ServerOptions extends CommonServerOptions {
 export interface ResolvedServerOptions extends ServerOptions {
   fs: Required<FileSystemServeOptions>
   middlewareMode: boolean
+  sourcemapIgnoreList: Exclude<
+    ServerOptions['sourcemapIgnoreList'],
+    false | undefined
+  >
 }
 
 export interface FileSystemServeOptions {
@@ -267,6 +284,11 @@ export interface ViteDevServer {
    * @param forceOptimize - force the optimizer to re-bundle, same as --force cli flag
    */
   restart(forceOptimize?: boolean): Promise<void>
+
+  /**
+   * Open browser
+   */
+  openBrowser(): void
   /**
    * @internal
    */
@@ -396,15 +418,30 @@ export async function createServer(
       }
     },
     async listen(port?: number, isRestart?: boolean) {
-      await startServer(server, port, isRestart)
+      await startServer(server, port)
       if (httpServer) {
         server.resolvedUrls = await resolveServerUrls(
           httpServer,
           config.server,
           config,
         )
+        if (!isRestart && config.server.open) server.openBrowser()
       }
       return server
+    },
+    openBrowser() {
+      const options = server.config.server
+      const url = server.resolvedUrls?.local[0]
+      if (url) {
+        const path =
+          typeof options.open === 'string'
+            ? new URL(options.open, url).href
+            : url
+
+        _openBrowser(path, true, server.config.logger)
+      } else {
+        server.config.logger.warn('No URL available to open in browser')
+      }
     },
     async close() {
       if (!middlewareMode) {
@@ -483,16 +520,10 @@ export async function createServer(
     return setPackageData(id, pkg)
   }
 
-  watcher.on('change', async (file) => {
-    file = normalizePath(file)
-    if (file.endsWith('/package.json')) {
-      return invalidatePackageData(packageCache, file)
-    }
-    // invalidate module graph cache on file change
-    moduleGraph.onFileChange(file)
+  const onHMRUpdate = async (file: string, configOnly: boolean) => {
     if (serverConfig.hmr !== false) {
       try {
-        await handleHMRUpdate(file, server)
+        await handleHMRUpdate(file, server, configOnly)
       } catch (err) {
         ws.send({
           type: 'error',
@@ -500,14 +531,27 @@ export async function createServer(
         })
       }
     }
+  }
+
+  const onFileAddUnlink = async (file: string) => {
+    file = normalizePath(file)
+    await handleFileAddUnlink(file, server)
+    await onHMRUpdate(file, true)
+  }
+
+  watcher.on('change', async (file) => {
+    file = normalizePath(file)
+    if (file.endsWith('/package.json')) {
+      return invalidatePackageData(packageCache, file)
+    }
+    // invalidate module graph cache on file change
+    moduleGraph.onFileChange(file)
+
+    await onHMRUpdate(file, false)
   })
 
-  watcher.on('add', (file) => {
-    handleFileAddUnlink(normalizePath(file), server)
-  })
-  watcher.on('unlink', (file) => {
-    handleFileAddUnlink(normalizePath(file), server)
-  })
+  watcher.on('add', onFileAddUnlink)
+  watcher.on('unlink', onFileAddUnlink)
 
   ws.on('vite:invalidate', async ({ path, message }: InvalidatePayload) => {
     const mod = moduleGraph.urlToModuleMap.get(path)
@@ -647,13 +691,16 @@ export async function createServer(
     await initServer()
   }
 
+  // Fire a clean up of stale cache dirs, in case old processes didn't
+  // terminate correctly. Don't await this promise
+  cleanupDepsCacheStaleDirs(config)
+
   return server
 }
 
 async function startServer(
   server: ViteDevServer,
   inlinePort?: number,
-  isRestart: boolean = false,
 ): Promise<void> {
   const httpServer = server.httpServer
   if (!httpServer) {
@@ -661,29 +708,15 @@ async function startServer(
   }
 
   const options = server.config.server
-  const port = inlinePort ?? options.port ?? 5173
+  const port = inlinePort ?? options.port ?? DEFAULT_DEV_PORT
   const hostname = await resolveHostname(options.host)
 
-  const protocol = options.https ? 'https' : 'http'
-
-  const serverPort = await httpServerStart(httpServer, {
+  await httpServerStart(httpServer, {
     port,
     strictPort: options.strictPort,
     host: hostname.host,
     logger: server.config.logger,
   })
-
-  if (options.open && !isRestart) {
-    const path =
-      typeof options.open === 'string' ? options.open : server.config.base
-    openBrowser(
-      path.startsWith('http')
-        ? path
-        : new URL(path, `${protocol}://${hostname.name}:${serverPort}`).href,
-      true,
-      server.config.logger,
-    )
-  }
 }
 
 function createServerCloseFn(server: http.Server | null) {
@@ -733,7 +766,12 @@ export function resolveServerOptions(
 ): ResolvedServerOptions {
   const server: ResolvedServerOptions = {
     preTransformRequests: true,
-    ...(raw as ResolvedServerOptions),
+    ...(raw as Omit<ResolvedServerOptions, 'sourcemapIgnoreList'>),
+    sourcemapIgnoreList:
+      raw?.sourcemapIgnoreList === false
+        ? () => false
+        : raw?.sourcemapIgnoreList ||
+          ((sourcePath) => sourcePath.includes('node_modules')),
     middlewareMode: !!raw?.middlewareMode,
   }
   let allowDirs = server.fs?.allow
@@ -809,7 +847,10 @@ async function restartServer(server: ViteDevServer) {
   if (!middlewareMode) {
     await server.listen(port, true)
     logger.info('server restarted.', { timestamp: true })
-    if ((port ?? 5173) !== (prevPort ?? 5173) || host !== prevHost) {
+    if (
+      (port ?? DEFAULT_DEV_PORT) !== (prevPort ?? DEFAULT_DEV_PORT) ||
+      host !== prevHost
+    ) {
       logger.info('')
       server.printUrls()
     }
