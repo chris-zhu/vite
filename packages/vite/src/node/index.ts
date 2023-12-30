@@ -1,16 +1,40 @@
-export * from './config'
+import type * as Rollup from 'rollup'
+
+export type { Rollup }
+export { parseAst, parseAstAsync } from 'rollup/parseAst'
+export {
+  defineConfig,
+  loadConfigFromFile,
+  resolveConfig,
+  sortUserPlugins,
+} from './config'
 export { createServer } from './server'
 export { preview } from './preview'
 export { build } from './build'
 export { optimizeDeps } from './optimizer'
 export { formatPostcssSourceMap, preprocessCSS } from './plugins/css'
 export { transformWithEsbuild } from './plugins/esbuild'
-export { resolvePackageEntry } from './plugins/resolve'
-export { resolvePackageData } from './packages'
 export { buildErrorMessage } from './server/middlewares/error'
 export * from './publicUtils'
 
 // additional types
+export type {
+  AppType,
+  ConfigEnv,
+  ExperimentalOptions,
+  InlineConfig,
+  LegacyOptions,
+  PluginHookUtils,
+  PluginOption,
+  ResolveFn,
+  ResolvedWorkerOptions,
+  ResolvedConfig,
+  UserConfig,
+  UserConfigExport,
+  UserConfigFn,
+  UserConfigFnObject,
+  UserConfigFnPromise,
+} from './config'
 export type { FilterPattern } from './utils'
 export type { CorsOptions, CorsOrigin, CommonServerOptions } from './http'
 export type {
@@ -27,6 +51,9 @@ export type {
   LibraryFormats,
   RenderBuiltAssetUrl,
   ResolvedBuildOptions,
+  ModulePreloadOptions,
+  ResolvedModulePreloadOptions,
+  ResolveModulePreloadDependenciesFn,
 } from './build'
 export type {
   PreviewOptions,
@@ -38,21 +65,16 @@ export type {
   DepOptimizationMetadata,
   DepOptimizationOptions,
   DepOptimizationConfig,
-  DepOptimizationResult,
-  DepOptimizationProcessing,
   OptimizedDepInfo,
-  DepsOptimizer,
   ExportsData,
 } from './optimizer'
 export type {
   ResolvedSSROptions,
   SsrDepOptimizationOptions,
   SSROptions,
-  SSRFormat,
   SSRTarget,
 } from './ssr'
 export type { Plugin, HookHandler } from './plugin'
-export type { PackageCache, PackageData } from './packages'
 export type {
   Logger,
   LogOptions,
@@ -72,6 +94,7 @@ export type {
   CSSOptions,
   CSSModulesOptions,
   PreprocessCSSResult,
+  ResolvedCSSOptions,
 } from './plugins/css'
 export type { JsonOptions } from './plugins/json'
 export type { TransformOptions as EsbuildTransformOptions } from 'esbuild'
@@ -79,6 +102,7 @@ export type { ESBuildOptions, ESBuildTransformResult } from './plugins/esbuild'
 export type { Manifest, ManifestChunk } from './plugins/manifest'
 export type { ResolveOptions, InternalResolveOptions } from './plugins/resolve'
 export type { SplitVendorChunkCache } from './plugins/splitVendorChunk'
+export type { TerserOptions } from './plugins/terser'
 
 export type {
   WebSocketServer,
@@ -94,6 +118,8 @@ export type {
   TransformResult,
 } from './server/transformRequest'
 export type { HmrOptions, HmrContext } from './server/hmr'
+
+export type { BindCLIShortcutsOptions, CLIShortcut } from './shortcuts'
 
 export type {
   HMRPayload,
@@ -112,7 +138,6 @@ export type {
 } from 'types/customEvent'
 export type {
   ImportGlobFunction,
-  ImportGlobEagerFunction,
   ImportGlobOptions,
   GeneralImportGlobOptions,
   KnownAsTypeMap,
@@ -139,3 +164,4 @@ export type { Terser } from 'dep-types/terser'
 export type { RollupCommonJSOptions } from 'dep-types/commonjs'
 export type { RollupDynamicImportVarsOptions } from 'dep-types/dynamicImportVars'
 export type { Matcher, AnymatchPattern, AnymatchFn } from 'dep-types/anymatch'
+export type { LightningCSSOptions } from 'dep-types/lightningcss'

@@ -1,7 +1,7 @@
-import vite from 'vite'
+import { defineConfig } from 'vite'
 import workerPluginTestPlugin from './worker-plugin-test-plugin'
 
-export default vite.defineConfig({
+export default defineConfig({
   base: '/es/',
   resolve: {
     alias: {
@@ -10,7 +10,7 @@ export default vite.defineConfig({
   },
   worker: {
     format: 'es',
-    plugins: [workerPluginTestPlugin()],
+    plugins: () => [workerPluginTestPlugin()],
     rollupOptions: {
       output: {
         assetFileNames: 'assets/worker_asset-[name].[ext]',
@@ -21,6 +21,7 @@ export default vite.defineConfig({
   },
   build: {
     outDir: 'dist/es',
+    assetsInlineLimit: 100, // keep SVG as assets URL
     rollupOptions: {
       output: {
         assetFileNames: 'assets/[name].[ext]',
@@ -44,4 +45,5 @@ export default vite.defineConfig({
       },
     },
   ],
+  cacheDir: 'node_modules/.vite-es',
 })

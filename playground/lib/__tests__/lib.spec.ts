@@ -6,6 +6,7 @@ import {
   readFile,
   serverLogs,
   untilUpdated,
+  withRetry,
 } from '~utils'
 
 describe.runIf(isBuild)('build', () => {
@@ -15,13 +16,17 @@ describe.runIf(isBuild)('build', () => {
 
   test('umd', async () => {
     expect(await page.textContent('.umd')).toBe('It works')
-    const code = readFile('dist/my-lib-custom-filename.umd.js')
-    const noMinifyCode = readFile('dist/nominify/my-lib-custom-filename.umd.js')
+    const code = readFile('dist/my-lib-custom-filename.umd.cjs')
+    const noMinifyCode = readFile(
+      'dist/nominify/my-lib-custom-filename.umd.cjs',
+    )
+    const namedCode = readFile('dist/named/my-lib-named.umd.cjs')
     // esbuild helpers are injected inside of the UMD wrapper
     expect(code).toMatch(/^\(function\(/)
     expect(noMinifyCode).toMatch(
       /^\(function\(global.+?"use strict";var.+?function\smyLib\(/s,
     )
+    expect(namedCode).toMatch(/^\(function\(/)
   })
 
   test('iife', async () => {
@@ -30,10 +35,23 @@ describe.runIf(isBuild)('build', () => {
     const noMinifyCode = readFile(
       'dist/nominify/my-lib-custom-filename.iife.js',
     )
+    const namedCode = readFile('dist/named/my-lib-named.iife.js')
     // esbuild helpers are injected inside of the IIFE wrapper
-    expect(code).toMatch(/^var MyLib=function\(\)\{"use strict";/)
+    expect(code).toMatch(/^var MyLib=function\(\)\{\s*"use strict";/)
     expect(noMinifyCode).toMatch(
-      /^var MyLib\s*=\s*function\(\)\s*\{.*?"use strict";/s,
+      /^var MyLib\s*=\s*function\(\)\s*\{\s*"use strict";/,
+    )
+    expect(namedCode).toMatch(
+      /^var MyLibNamed=function\([^()]+\)\{\s*"use strict";/,
+    )
+  })
+
+  test('restrisct-helpers-injection', async () => {
+    const code = readFile(
+      'dist/helpers-injection/my-lib-custom-filename.iife.js',
+    )
+    expect(code).toMatch(
+      `'"use strict"; return (' + expressionSyntax + ").constructor;"`,
     )
   })
 
@@ -46,7 +64,7 @@ describe.runIf(isBuild)('build', () => {
     expect(code).not.toMatch('__vitePreload')
 
     // Test that library chunks are hashed
-    expect(code).toMatch(/await import\("\.\/message-[a-z\d]{8}.mjs"\)/)
+    expect(code).toMatch(/await import\("\.\/message-[-\w]{8}.js"\)/)
   })
 
   test('@import hoist', async () => {
@@ -57,9 +75,9 @@ describe.runIf(isBuild)('build', () => {
   })
 
   test('preserve process.env', () => {
-    const es = readFile('dist/my-lib-custom-filename.mjs')
+    const es = readFile('dist/my-lib-custom-filename.js')
     const iife = readFile('dist/my-lib-custom-filename.iife.js')
-    const umd = readFile('dist/my-lib-custom-filename.umd.js')
+    const umd = readFile('dist/my-lib-custom-filename.umd.cjs')
     expect(es).toMatch('process.env.NODE_ENV')
     expect(iife).toMatch('process.env.NODE_ENV')
     expect(umd).toMatch('process.env.NODE_ENV')
@@ -67,5 +85,7 @@ describe.runIf(isBuild)('build', () => {
 })
 
 test.runIf(isServe)('dev', async () => {
-  expect(await page.textContent('.demo')).toBe('It works')
+  await withRetry(async () => {
+    expect(await page.textContent('.demo')).toBe('It works')
+  })
 })

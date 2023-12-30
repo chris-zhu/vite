@@ -53,10 +53,11 @@ export const core = [
     avatar: 'https://github.com/sapphi-red.png',
     name: 'green',
     title: 'Web Developer',
-    desc: 'Vite team member. Call me sapphi or green or midori ;)',
+    desc: 'Vite core team member. Call me sapphi or green or midori ;)',
     links: [
       { icon: 'github', link: 'https://github.com/sapphi-red' },
       { icon: 'twitter', link: 'https://twitter.com/sapphi_red' },
+      { icon: 'mastodon', link: 'https://elk.zone/m.webtoo.ls/@sapphi_red' },
     ],
     sponsor: 'https://github.com/sponsors/sapphi-red',
   },
@@ -82,7 +83,7 @@ export const core = [
     desc: 'Passionate TypeScript enthusiast working extensively with Vue SPA and pug.',
     links: [
       { icon: 'github', link: 'https://github.com/Shinigami92' },
-      { icon: 'twitter', link: 'https://twitter.com/Shini_92' },
+      { icon: 'mastodon', link: 'https://elk.zone/mas.to/@Shini92' },
     ],
     sponsor: 'https://github.com/sponsors/Shinigami92',
   },
@@ -120,7 +121,23 @@ export const core = [
     name: 'Dominik G.',
     title: 'Resident CI Expert',
     desc: 'Team Member of Vite and Svelte',
-    links: [{ icon: 'github', link: 'https://github.com/dominikg' }],
+    links: [
+      { icon: 'github', link: 'https://github.com/dominikg' },
+      { icon: 'mastodon', link: 'https://elk.zone/m.webtoo.ls/@dominikg' },
+    ],
+    sponsor: 'https://github.com/sponsors/dominikg',
+  },
+  {
+    avatar: 'https://github.com/sheremet-va.png',
+    name: 'Vladimir',
+    title: 'Core team member of Vitest & Vite',
+    desc: 'An open source fullstack developer',
+    links: [
+      { icon: 'github', link: 'https://github.com/sheremet-va' },
+      { icon: 'mastodon', link: 'https://elk.zone/m.webtoo.ls/@sheremet_va' },
+      { icon: 'twitter', link: 'https://twitter.com/sheremet_va' },
+    ],
+    sponsor: 'https://github.com/sponsors/sheremet-va',
   },
 ]
 

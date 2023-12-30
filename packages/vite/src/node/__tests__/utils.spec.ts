@@ -3,9 +3,11 @@ import path from 'node:path'
 import { describe, expect, test } from 'vitest'
 import {
   asyncFlatten,
+  bareImportRE,
+  flattenId,
+  generateCodeFrame,
   getHash,
   getLocalhostAddressIfDiffersFromDNS,
-  getPotentialTsSrcPaths,
   injectQuery,
   isFileReadable,
   isWindows,
@@ -13,6 +15,25 @@ import {
   processSrcSetSync,
   resolveHostname,
 } from '../utils'
+
+describe('bareImportRE', () => {
+  test('should work with normal package name', () => {
+    expect(bareImportRE.test('vite')).toBe(true)
+  })
+  test('should work with scoped package name', () => {
+    expect(bareImportRE.test('@vitejs/plugin-vue')).toBe(true)
+  })
+
+  test('should work with absolute paths', () => {
+    expect(bareImportRE.test('/foo')).toBe(false)
+    expect(bareImportRE.test('C:/foo')).toBe(false)
+    expect(bareImportRE.test('C:\\foo')).toBe(false)
+  })
+  test('should work with relative path', () => {
+    expect(bareImportRE.test('./foo')).toBe(false)
+    expect(bareImportRE.test('.\\foo')).toBe(false)
+  })
+})
 
 describe('injectQuery', () => {
   if (isWindows) {
@@ -137,42 +158,6 @@ describe('resolveHostname', () => {
   })
 })
 
-test('ts import of file with .js extension', () => {
-  expect(getPotentialTsSrcPaths('test-file.js')).toEqual([
-    'test-file.ts',
-    'test-file.tsx',
-  ])
-})
-
-test('ts import of file with .jsx extension', () => {
-  expect(getPotentialTsSrcPaths('test-file.jsx')).toEqual(['test-file.tsx'])
-})
-
-test('ts import of file .mjs,.cjs extension', () => {
-  expect(getPotentialTsSrcPaths('test-file.cjs')).toEqual([
-    'test-file.cts',
-    'test-file.ctsx',
-  ])
-  expect(getPotentialTsSrcPaths('test-file.mjs')).toEqual([
-    'test-file.mts',
-    'test-file.mtsx',
-  ])
-})
-
-test('ts import of file with .js before extension', () => {
-  expect(getPotentialTsSrcPaths('test-file.js.js')).toEqual([
-    'test-file.js.ts',
-    'test-file.js.tsx',
-  ])
-})
-
-test('ts import of file with .js and query param', () => {
-  expect(getPotentialTsSrcPaths('test-file.js.js?lee=123')).toEqual([
-    'test-file.js.ts?lee=123',
-    'test-file.js.tsx?lee=123',
-  ])
-})
-
 describe('posToNumber', () => {
   test('simple', () => {
     const actual = posToNumber('a\nb', { line: 2, column: 0 })
@@ -189,6 +174,74 @@ describe('posToNumber', () => {
   test('out of range', () => {
     const actual = posToNumber('a\nb', { line: 4, column: 0 })
     expect(actual).toBe(4)
+  })
+})
+
+describe('generateCodeFrames', () => {
+  const source = `
+import foo from './foo'
+foo()
+`.trim()
+  const sourceCrLf = source.replace(/\n/, '\r\n')
+  const longSource = `
+import foo from './foo'
+
+foo()
+// 1
+// 2
+// 3
+`.trim()
+
+  const expectSnapshot = (value: string) => {
+    try {
+      // add new line to make snapshot easier to read
+      expect('\n' + value + '\n').toMatchSnapshot()
+    } catch (e) {
+      // don't include this function in stacktrace
+      Error.captureStackTrace(e, expectSnapshot)
+      throw e
+    }
+  }
+
+  test('start with number', () => {
+    expectSnapshot(generateCodeFrame(source, -1))
+    expectSnapshot(generateCodeFrame(source, 0))
+    expectSnapshot(generateCodeFrame(source, 1))
+    expectSnapshot(generateCodeFrame(source, 24))
+  })
+
+  test('start with postion', () => {
+    expectSnapshot(generateCodeFrame(source, { line: 1, column: 0 }))
+    expectSnapshot(generateCodeFrame(source, { line: 1, column: 1 }))
+    expectSnapshot(generateCodeFrame(source, { line: 2, column: 0 }))
+  })
+
+  test('works with CRLF', () => {
+    expectSnapshot(generateCodeFrame(sourceCrLf, { line: 2, column: 0 }))
+  })
+
+  test('end', () => {
+    expectSnapshot(generateCodeFrame(source, 0, 0))
+    expectSnapshot(generateCodeFrame(source, 0, 23))
+    expectSnapshot(generateCodeFrame(source, 0, 29))
+    expectSnapshot(generateCodeFrame(source, 0, source.length))
+    expectSnapshot(generateCodeFrame(source, 0, source.length + 1))
+    expectSnapshot(generateCodeFrame(source, 0, source.length + 100))
+  })
+
+  test('range', () => {
+    expectSnapshot(generateCodeFrame(longSource, { line: 3, column: 0 }))
+    expectSnapshot(
+      generateCodeFrame(
+        longSource,
+        { line: 3, column: 0 },
+        { line: 4, column: 0 },
+      ),
+    )
+  })
+
+  test('invalid start > end', () => {
+    expectSnapshot(generateCodeFrame(source, 2, 0))
   })
 })
 
@@ -258,11 +311,14 @@ describe('isFileReadable', () => {
       fs.chmodSync(testFile, '400')
       expect(isFileReadable(testFile)).toBe(true)
     })
-    test('file without read permission', async () => {
-      fs.chmodSync(testFile, '044')
-      expect(isFileReadable(testFile)).toBe(false)
-      fs.chmodSync(testFile, '644')
-    })
+    test.runIf(process.getuid && process.getuid() !== 0)(
+      'file without read permission',
+      async () => {
+        fs.chmodSync(testFile, '044')
+        expect(isFileReadable(testFile)).toBe(false)
+        fs.chmodSync(testFile, '644')
+      },
+    )
   }
 })
 
@@ -275,5 +331,30 @@ describe('processSrcSetSync', () => {
         ({ url }) => path.posix.join(devBase, url),
       ),
     ).toBe('/base/nested/asset.png 1x, /base/nested/asset.png 2x')
+  })
+
+  test('should not split the comma inside base64 value', async () => {
+    const base64 =
+      'data:image/avif;base64,aA+/0= 400w, data:image/avif;base64,bB+/9= 800w'
+    expect(processSrcSetSync(base64, ({ url }) => url)).toBe(base64)
+  })
+})
+
+describe('flattenId', () => {
+  test('should limit id to 170 characters', () => {
+    const tenChars = '1234567890'
+    let id = ''
+
+    for (let i = 0; i < 17; i++) {
+      id += tenChars
+    }
+    expect(id).toHaveLength(170)
+
+    const result = flattenId(id)
+    expect(result).toHaveLength(170)
+
+    id += tenChars
+    const result2 = flattenId(id)
+    expect(result2).toHaveLength(170)
   })
 })

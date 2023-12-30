@@ -2,7 +2,9 @@ import type { ErrorPayload } from 'types/hmrPayload'
 
 // injected by the hmr plugin when served
 declare const __BASE__: string
+declare const __HMR_CONFIG_NAME__: string
 
+const hmrConfigName = __HMR_CONFIG_NAME__
 const base = __BASE__ || '/'
 
 // set :host styles to make playwright detect the element as visible
@@ -69,6 +71,20 @@ pre::-webkit-scrollbar {
   display: none;
 }
 
+pre.frame::-webkit-scrollbar {
+  display: block;
+  height: 5px;
+}
+
+pre.frame::-webkit-scrollbar-thumb {
+  background: #999;
+  border-radius: 5px;
+}
+
+pre.frame {
+  scrollbar-width: thin;
+}
+
 .message {
   line-height: 1.3;
   font-weight: 600;
@@ -104,6 +120,7 @@ pre::-webkit-scrollbar {
   color: #999;
   border-top: 1px dotted #999;
   padding-top: 13px;
+  line-height: 1.8;
 }
 
 code {
@@ -116,6 +133,21 @@ code {
   text-decoration: underline;
   cursor: pointer;
 }
+
+kbd {
+  line-height: 1.5;
+  font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.75rem;
+  font-weight: 700;
+  background-color: rgb(38, 40, 44);
+  color: rgb(166, 167, 171);
+  padding: 0.15rem 0.3rem;
+  border-radius: 0.25rem;
+  border-width: 0.0625rem 0.0625rem 0.1875rem;
+  border-style: solid;
+  border-color: rgb(54, 57, 64);
+  border-image: initial;
+}
 </style>
 <div class="backdrop" part="backdrop">
   <div class="window" part="window">
@@ -124,22 +156,23 @@ code {
     <pre class="frame" part="frame"></pre>
     <pre class="stack" part="stack"></pre>
     <div class="tip" part="tip">
-      Click outside or fix the code to dismiss.<br>
+      Click outside, press <kbd>Esc</kbd> key, or fix the code to dismiss.<br>
       You can also disable this overlay by setting
-      <code part="config-option-name">server.hmr.overlay</code> to <code part="config-option-value">false</code> in <code part="config-file-name">vite.config.js.</code>
+      <code part="config-option-name">server.hmr.overlay</code> to <code part="config-option-value">false</code> in <code part="config-file-name">${hmrConfigName}.</code>
     </div>
   </div>
 </div>
 `
 
 const fileRE = /(?:[a-zA-Z]:\\|\/).*?:\d+:\d+/g
-const codeframeRE = /^(?:>?\s+\d+\s+\|.*|\s+\|\s*\^.*)\r?\n/gm
+const codeframeRE = /^(?:>?\s*\d+\s+\|.*|\s+\|\s*\^.*)\r?\n/gm
 
 // Allow `ErrorOverlay` to extend `HTMLElement` even in environments where
 // `HTMLElement` was not originally defined.
 const { HTMLElement = class {} as typeof globalThis.HTMLElement } = globalThis
 export class ErrorOverlay extends HTMLElement {
   root: ShadowRoot
+  closeOnEsc: (e: KeyboardEvent) => void
 
   constructor(err: ErrorPayload['err'], links = true) {
     super()
@@ -171,9 +204,18 @@ export class ErrorOverlay extends HTMLElement {
     this.root.querySelector('.window')!.addEventListener('click', (e) => {
       e.stopPropagation()
     })
+
     this.addEventListener('click', () => {
       this.close()
     })
+
+    this.closeOnEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' || e.code === 'Escape') {
+        this.close()
+      }
+    }
+
+    document.addEventListener('keydown', this.closeOnEsc)
   }
 
   text(selector: string, text: string, linkFiles = false): void {
@@ -193,7 +235,12 @@ export class ErrorOverlay extends HTMLElement {
           link.textContent = file
           link.className = 'file-link'
           link.onclick = () => {
-            fetch(`${base}__open-in-editor?file=` + encodeURIComponent(file))
+            fetch(
+              new URL(
+                `${base}__open-in-editor?file=${encodeURIComponent(file)}`,
+                import.meta.url,
+              ),
+            )
           }
           el.appendChild(link)
           curIndex += frag.length + file.length
@@ -201,9 +248,9 @@ export class ErrorOverlay extends HTMLElement {
       }
     }
   }
-
   close(): void {
     this.parentNode?.removeChild(this)
+    document.removeEventListener('keydown', this.closeOnEsc)
   }
 }
 

@@ -34,6 +34,13 @@ The second case is when wildcard hosts (e.g. `0.0.0.0`) are used. This is becaus
 
 :::
 
+::: tip Accessing the server on WSL2 from your LAN
+
+When running Vite on WSL2, it is not sufficient to set `host: true` to access the server from your LAN.
+See [the WSL document](https://learn.microsoft.com/en-us/windows/wsl/networking#accessing-a-wsl-2-distribution-from-your-local-area-network-lan) for more details.
+
+:::
+
 ## server.port
 
 - **Type:** `number`
@@ -49,7 +56,7 @@ Set to `true` to exit if port is already in use, instead of automatically trying
 
 ## server.https
 
-- **Type:** `boolean | https.ServerOptions`
+- **Type:** `https.ServerOptions`
 
 Enable TLS + HTTP/2. Note this downgrades to TLS only when the [`server.proxy` option](#server-proxy) is also used.
 
@@ -83,7 +90,7 @@ Configure custom proxy rules for the dev server. Expects an object of `{ key: op
 
 Note that if you are using non-relative [`base`](/config/shared-options.md#base), you must prefix each key with that `base`.
 
-Extends [`http-proxy`](https://github.com/http-party/node-http-proxy#options). Additional options are [here](https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/middlewares/proxy.ts#L13).
+Extends [`http-proxy`](https://github.com/http-party/node-http-proxy#options). Additional options are [here](https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/middlewares/proxy.ts#L12).
 
 In some cases, you might also want to configure the underlying dev server (e.g. to add custom middlewares to the internal [connect](https://github.com/senchalabs/connect) app). In order to do that, you need to write your own [plugin](/guide/using-plugins.html) and use [configureServer](/guide/api-plugin.html#configureserver) function.
 
@@ -167,28 +174,43 @@ The error that appears in the Browser when the fallback happens can be ignored. 
 
 :::
 
-## server.watch
+## server.warmup
 
-- **Type:** `object`
+- **Type:** `{ clientFiles?: string[], ssrFiles?: string[] }`
+- **Related:** [Warm Up Frequently Used Files](/guide/performance.html#warm-up-frequently-used-files)
 
-File system watcher options to pass on to [chokidar](https://github.com/paulmillr/chokidar#api).
+Warm up files to transform and cache the results in advance. This improves the initial page load during server starts and prevents transform waterfalls.
 
-The Vite server watcher skips `.git/` and `node_modules/` directories by default. If you want to watch a package inside `node_modules/`, you can pass a negated glob pattern to `server.watch.ignored`. That is:
+`clientFiles` are files that are used in the client only, while `ssrFiles` are files that are used in SSR only. They accept an array of file paths or [`fast-glob`](https://github.com/mrmlnc/fast-glob) patterns relative to the `root`.
+
+Make sure to only add files that are frequently used to not overload the Vite dev server on startup.
 
 ```js
 export default defineConfig({
   server: {
-    watch: {
-      ignored: ['!**/node_modules/your-package-name/**'],
+    warmup: {
+      clientFiles: ['./src/components/*.vue', './src/utils/big-utils.js'],
+      ssrFiles: ['./src/server/modules/*.js'],
     },
-  },
-  // The watched package must be excluded from optimization,
-  // so that it can appear in the dependency graph and trigger hot reload.
-  optimizeDeps: {
-    exclude: ['your-package-name'],
   },
 })
 ```
+
+## server.watch
+
+- **Type:** `object | null`
+
+File system watcher options to pass on to [chokidar](https://github.com/paulmillr/chokidar#api).
+
+The Vite server watcher watches the `root` and skips the `.git/` and `node_modules/` directories by default. When updating a watched file, Vite will apply HMR and update the page only if needed.
+
+If set to `null`, no files will be watched. `server.watcher` will provide a compatible event emitter, but calling `add` or `unwatch` will have no effect.
+
+::: warning Watching files in `node_modules`
+
+It's currently not possible to watch files and packages in `node_modules`. For further progress and workarounds, you can follow [issue #8619](https://github.com/vitejs/vite/issues/8619).
+
+:::
 
 ::: warning Using Vite on Windows Subsystem for Linux (WSL) 2
 
@@ -240,12 +262,6 @@ async function createServer() {
 createServer()
 ```
 
-## server.base
-
-- **Type:** `string | undefined`
-
-Prepend this folder to http requests, for use when proxying vite as a subfolder. Should start with the `/` character.
-
 ## server.fs.strict
 
 - **Type:** `boolean`
@@ -258,6 +274,8 @@ Restrict serving files outside of workspace root.
 - **Type:** `string[]`
 
 Restrict files that could be served via `/@fs/`. When `server.fs.strict` is set to `true`, accessing files outside this directory list that aren't imported from an allowed file will result in a 403.
+
+Both directories and files can be provided.
 
 Vite will search for the root of the potential workspace and use it as default. A valid workspace met the following conditions, otherwise will fall back to the [project root](/guide/#index-html-and-project-root).
 
@@ -291,7 +309,8 @@ export default defineConfig({
         // search up for workspace root
         searchForWorkspaceRoot(process.cwd()),
         // your custom rules
-        '/path/to/custom/allow',
+        '/path/to/custom/allow_directory',
+        '/path/to/custom/allow_file.demo',
       ],
     },
   },
@@ -324,16 +343,24 @@ export default defineConfig({
 - **Type:** `false | (sourcePath: string, sourcemapPath: string) => boolean`
 - **Default:** `(sourcePath) => sourcePath.includes('node_modules')`
 
-Whether or not to ignore source files in the server sourcemap, used to populate the [`x_google_ignoreList` source map extension](https://developer.chrome.com/blog/devtools-better-angular-debugging/#the-x_google_ignorelist-source-map-extension).
+Whether or not to ignore source files in the server sourcemap, used to populate the [`x_google_ignoreList` source map extension](https://developer.chrome.com/articles/x-google-ignore-list/).
+
+`server.sourcemapIgnoreList` is the equivalent of [`build.rollupOptions.output.sourcemapIgnoreList`](https://rollupjs.org/configuration-options/#output-sourcemapignorelist) for the dev server. A difference between the two config options is that the rollup function is called with a relative path for `sourcePath` while `server.sourcemapIgnoreList` is called with an absolute path. During dev, most modules have the map and the source in the same folder, so the relative path for `sourcePath` is the file name itself. In these cases, absolute paths makes it convenient to be used instead.
 
 By default, it excludes all paths containing `node_modules`. You can pass `false` to disable this behavior, or, for full control, a function that takes the source path and sourcemap path and returns whether to ignore the source path.
 
 ```js
 export default defineConfig({
   server: {
-    // This is the default value, and will add all files with node_modules in their paths
-    // to the ignore list.
-    sourcemapIgnoreList: (sourcePath, sourcemapPath) => sourcePath.includes('node_modules')
+    // This is the default value, and will add all files with node_modules
+    // in their paths to the ignore list.
+    sourcemapIgnoreList(sourcePath, sourcemapPath) {
+      return sourcePath.includes('node_modules')
+    }
   }
 };
 ```
+
+::: tip Note
+[`server.sourcemapIgnoreList`](#server-sourcemapignorelist) and [`build.rollupOptions.output.sourcemapIgnoreList`](https://rollupjs.org/configuration-options/#output-sourcemapignorelist) need to be set independently. `server.sourcemapIgnoreList` is a server only config and doesn't get its default value from the defined rollup options.
+:::

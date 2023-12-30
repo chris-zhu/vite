@@ -9,6 +9,7 @@ const { version } = JSON.parse(
 export const VERSION = version as string
 
 export const DEFAULT_MAIN_FIELDS = [
+  'browser',
   'module',
   'jsnext:main', // moment still uses this...
   'jsnext',
@@ -96,6 +97,7 @@ export const CLIENT_DIR = path.dirname(CLIENT_ENTRY)
 //   looked up by mrmime.
 export const KNOWN_ASSET_TYPES = [
   // images
+  'apng',
   'png',
   'jpe?g',
   'jfif',
@@ -115,6 +117,8 @@ export const KNOWN_ASSET_TYPES = [
   'wav',
   'flac',
   'aac',
+  'opus',
+  'mov',
 
   // fonts
   'woff2?',

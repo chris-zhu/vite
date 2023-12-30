@@ -1,11 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type * as http from 'node:http'
 import sirv from 'sirv'
 import connect from 'connect'
 import type { Connect } from 'dep-types/connect'
 import corsMiddleware from 'cors'
-import type { ResolvedServerOptions, ResolvedServerUrls } from './server'
+import type {
+  HttpServer,
+  ResolvedServerOptions,
+  ResolvedServerUrls,
+} from './server'
 import type { CommonServerOptions } from './http'
 import {
   httpServerStart,
@@ -15,12 +18,18 @@ import {
 } from './http'
 import { openBrowser } from './server/openBrowser'
 import compression from './server/middlewares/compression'
+import { baseMiddleware } from './server/middlewares/base'
+import { htmlFallbackMiddleware } from './server/middlewares/htmlFallback'
+import { indexHtmlMiddleware } from './server/middlewares/indexHtml'
+import { notFoundMiddleware } from './server/middlewares/notFound'
 import { proxyMiddleware } from './server/middlewares/proxy'
 import { resolveHostname, resolveServerUrls, shouldServeFile } from './utils'
 import { printServerUrls } from './logger'
+import { bindCLIShortcuts } from './shortcuts'
+import type { BindCLIShortcutsOptions } from './shortcuts'
 import { DEFAULT_PREVIEW_PORT } from './constants'
-import { resolveConfig } from '.'
-import type { InlineConfig, ResolvedConfig } from '.'
+import { resolveConfig } from './config'
+import type { InlineConfig, ResolvedConfig } from './config'
 
 export interface PreviewOptions extends CommonServerOptions {}
 
@@ -51,25 +60,36 @@ export interface PreviewServer {
    */
   config: ResolvedConfig
   /**
+   * A connect app instance.
+   * - Can be used to attach custom middlewares to the preview server.
+   * - Can also be used as the handler function of a custom http server
+   *   or as a middleware in any connect-style Node.js frameworks
+   *
+   * https://github.com/senchalabs/connect#use-middleware
+   */
+  middlewares: Connect.Server
+  /**
    * native Node http server instance
    */
-  httpServer: http.Server
+  httpServer: HttpServer
   /**
-   * The resolved urls Vite prints on the CLI
+   * The resolved urls Vite prints on the CLI.
+   * null before server is listening.
    */
-  resolvedUrls: ResolvedServerUrls
+  resolvedUrls: ResolvedServerUrls | null
   /**
    * Print server urls
    */
   printUrls(): void
+  /**
+   * Bind CLI shortcuts
+   */
+  bindCLIShortcuts(options?: BindCLIShortcutsOptions<PreviewServer>): void
 }
 
 export type PreviewServerHook = (
   this: void,
-  server: {
-    middlewares: Connect.Server
-    httpServer: http.Server
-  },
+  server: PreviewServer,
 ) => (() => void) | void | Promise<(() => void) | void>
 
 /**
@@ -108,10 +128,30 @@ export async function preview(
   )
   setClientErrorHandler(httpServer, config.logger)
 
+  const options = config.preview
+  const logger = config.logger
+
+  const server: PreviewServer = {
+    config,
+    middlewares: app,
+    httpServer,
+    resolvedUrls: null,
+    printUrls() {
+      if (server.resolvedUrls) {
+        printServerUrls(server.resolvedUrls, options.host, logger.info)
+      } else {
+        throw new Error('cannot print server URLs before server is listening.')
+      }
+    },
+    bindCLIShortcuts(options) {
+      bindCLIShortcuts(server as PreviewServer, options)
+    },
+  }
+
   // apply server hooks from plugins
   const postHooks: ((() => void) | void)[] = []
   for (const hook of config.getSortedPluginHooks('configurePreviewServer')) {
-    postHooks.push(await hook({ middlewares: app, httpServer }))
+    postHooks.push(await hook(server))
   }
 
   // cors
@@ -128,67 +168,73 @@ export async function preview(
 
   app.use(compression())
 
-  const previewBase =
-    config.base === './' || config.base === '' ? '/' : config.base
+  // base
+  if (config.base !== '/') {
+    app.use(baseMiddleware(config.rawBase, false))
+  }
 
   // static assets
   const headers = config.preview.headers
-  const assetServer = sirv(distDir, {
-    etag: true,
-    dev: true,
-    single: config.appType === 'spa',
-    setHeaders(res) {
-      if (headers) {
-        for (const name in headers) {
-          res.setHeader(name, headers[name]!)
+  const viteAssetMiddleware = (...args: readonly [any, any?, any?]) =>
+    sirv(distDir, {
+      etag: true,
+      dev: true,
+      extensions: [],
+      ignores: false,
+      setHeaders(res) {
+        if (headers) {
+          for (const name in headers) {
+            res.setHeader(name, headers[name]!)
+          }
         }
-      }
-    },
-    shouldServe(filePath) {
-      return shouldServeFile(filePath, distDir)
-    },
-  })
-  app.use(previewBase, assetServer)
+      },
+      shouldServe(filePath) {
+        return shouldServeFile(filePath, distDir)
+      },
+    })(...args)
+
+  app.use(viteAssetMiddleware)
+
+  // html fallback
+  if (config.appType === 'spa' || config.appType === 'mpa') {
+    app.use(htmlFallbackMiddleware(distDir, config.appType === 'spa'))
+  }
 
   // apply post server hooks from plugins
   postHooks.forEach((fn) => fn && fn())
 
-  const options = config.preview
+  if (config.appType === 'spa' || config.appType === 'mpa') {
+    // transform index.html
+    app.use(indexHtmlMiddleware(distDir, server))
+
+    // handle 404s
+    app.use(notFoundMiddleware())
+  }
+
   const hostname = await resolveHostname(options.host)
   const port = options.port ?? DEFAULT_PREVIEW_PORT
-  const protocol = options.https ? 'https' : 'http'
-  const logger = config.logger
 
-  const serverPort = await httpServerStart(httpServer, {
+  await httpServerStart(httpServer, {
     port,
     strictPort: options.strictPort,
     host: hostname.host,
     logger,
   })
 
-  const resolvedUrls = await resolveServerUrls(
+  server.resolvedUrls = await resolveServerUrls(
     httpServer,
     config.preview,
     config,
   )
 
   if (options.open) {
-    const path = typeof options.open === 'string' ? options.open : previewBase
-    openBrowser(
-      path.startsWith('http')
-        ? path
-        : new URL(path, `${protocol}://${hostname.name}:${serverPort}`).href,
-      true,
-      logger,
-    )
+    const url = server.resolvedUrls?.local[0] ?? server.resolvedUrls?.network[0]
+    if (url) {
+      const path =
+        typeof options.open === 'string' ? new URL(options.open, url).href : url
+      openBrowser(path, true, logger)
+    }
   }
 
-  return {
-    config,
-    httpServer,
-    resolvedUrls,
-    printUrls() {
-      printServerUrls(resolvedUrls, options.host, logger.info)
-    },
-  }
+  return server as PreviewServer
 }

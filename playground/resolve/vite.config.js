@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { defineConfig, normalizePath } from 'vite'
-import { a } from './config-dep'
+import { a } from './config-dep.cjs'
 
 const virtualFile = '@virtual-file'
 const virtualId = '\0' + virtualFile
@@ -27,7 +27,7 @@ const generatedContentImports = [
 export default defineConfig({
   resolve: {
     extensions: ['.mjs', '.js', '.es', '.ts'],
-    mainFields: ['custom', 'module'],
+    mainFields: ['browser', 'custom', 'module'],
     conditions: ['custom'],
   },
   define: {
@@ -101,6 +101,13 @@ export default defineConfig({
     },
   ],
   optimizeDeps: {
-    include: ['@vitejs/test-require-pkg-with-module-field'],
+    include: [
+      '@vitejs/test-resolve-exports-with-module-condition-required',
+      '@vitejs/test-require-pkg-with-module-field',
+      '@vitejs/test-resolve-sharp-dir',
+    ],
+  },
+  build: {
+    copyPublicDir: false,
   },
 })

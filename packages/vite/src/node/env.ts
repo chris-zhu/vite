@@ -1,8 +1,18 @@
 import fs from 'node:fs'
+import path from 'node:path'
 import { parse } from 'dotenv'
 import { expand } from 'dotenv-expand'
-import { arraify, lookupFile } from './utils'
+import { arraify, tryStatSync } from './utils'
 import type { UserConfig } from './config'
+
+export function getEnvFilesForMode(mode: string): string[] {
+  return [
+    /** default file */ `.env`,
+    /** local file */ `.env.local`,
+    /** mode file */ `.env.${mode}`,
+    /** mode local file */ `.env.${mode}.local`,
+  ]
+}
 
 export function loadEnv(
   mode: string,
@@ -17,21 +27,14 @@ export function loadEnv(
   }
   prefixes = arraify(prefixes)
   const env: Record<string, string> = {}
-  const envFiles = [
-    /** default file */ `.env`,
-    /** local file */ `.env.local`,
-    /** mode file */ `.env.${mode}`,
-    /** mode local file */ `.env.${mode}.local`,
-  ]
+  const envFiles = getEnvFilesForMode(mode)
 
   const parsed = Object.fromEntries(
     envFiles.flatMap((file) => {
-      const path = lookupFile(envDir, [file], {
-        pathOnly: true,
-        rootDir: envDir,
-      })
-      if (!path) return []
-      return Object.entries(parse(fs.readFileSync(path)))
+      const filePath = path.join(envDir, file)
+      if (!tryStatSync(filePath)?.isFile()) return []
+
+      return Object.entries(parse(fs.readFileSync(filePath)))
     }),
   )
 
@@ -73,7 +76,7 @@ export function resolveEnvPrefix({
   envPrefix = 'VITE_',
 }: UserConfig): string[] {
   envPrefix = arraify(envPrefix)
-  if (envPrefix.some((prefix) => prefix === '')) {
+  if (envPrefix.includes('')) {
     throw new Error(
       `envPrefix option contains value '', which could lead unexpected exposure of sensitive information.`,
     )

@@ -67,4 +67,15 @@ describe('transformWithEsbuild', () => {
       'import { MainTypeOnlyClass } from "./not-used-type";',
     )
   })
+
+  test('experimentalDecorators', async () => {
+    const main = path.resolve(__dirname, '../src/decorator.ts')
+    const mainContent = fs.readFileSync(main, 'utf-8')
+    // Should not error when transpiling decorators as nearest tsconfig.json
+    // has "experimentalDecorators": true
+    const result = await transformWithEsbuild(mainContent, main, {
+      target: 'es2020',
+    })
+    expect(result.code).toContain('__decorateClass')
+  })
 })

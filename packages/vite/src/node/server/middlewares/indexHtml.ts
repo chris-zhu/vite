@@ -1,4 +1,4 @@
-import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
 import MagicString from 'magic-string'
 import type { SourceMapInput } from 'rollup'
@@ -9,8 +9,12 @@ import {
   addToHTMLProxyCache,
   applyHtmlTransforms,
   assetAttrsConfig,
+  extractImportExpressionFromClassicScript,
+  findNeedTransformStyleAttribute,
   getAttrKey,
   getScriptInfo,
+  htmlEnvHook,
+  htmlProxyResult,
   nodeIsElement,
   overwriteAttrValue,
   postImportMapHook,
@@ -18,20 +22,28 @@ import {
   resolveHtmlTransforms,
   traverseHtml,
 } from '../../plugins/html'
-import type { ResolvedConfig, ViteDevServer } from '../..'
+import type { PreviewServer, ResolvedConfig, ViteDevServer } from '../..'
 import { send } from '../send'
 import { CLIENT_PUBLIC_PATH, FS_PREFIX } from '../../constants'
 import {
   cleanUrl,
   ensureWatchedFile,
   fsPathFromId,
+  getHash,
   injectQuery,
+  isDevServer,
+  isJSRequest,
   joinUrlSegments,
   normalizePath,
   processSrcSetSync,
+  stripBase,
+  unwrapId,
   wrapId,
 } from '../../utils'
-import type { ModuleGraph } from '../moduleGraph'
+import { getFsUtils } from '../../fsUtils'
+import { checkPublicFile } from '../../publicDir'
+import { isCSSRequest } from '../../plugins/css'
+import { getCodeWithSourcemap, injectSourcesContent } from '../sourcemap'
 
 interface AssetNode {
   start: number
@@ -39,18 +51,36 @@ interface AssetNode {
   code: string
 }
 
+interface InlineStyleAttribute {
+  index: number
+  location: Token.Location
+  code: string
+}
+
 export function createDevHtmlTransformFn(
+  config: ResolvedConfig,
+): (
   server: ViteDevServer,
-): (url: string, html: string, originalUrl: string) => Promise<string> {
+  url: string,
+  html: string,
+  originalUrl?: string,
+) => Promise<string> {
   const [preHooks, normalHooks, postHooks] = resolveHtmlTransforms(
-    server.config.plugins,
+    config.plugins,
+    config.logger,
   )
-  return (url: string, html: string, originalUrl: string): Promise<string> => {
+  return (
+    server: ViteDevServer,
+    url: string,
+    html: string,
+    originalUrl?: string,
+  ): Promise<string> => {
     return applyHtmlTransforms(
       html,
       [
-        preImportMapHook(server.config),
+        preImportMapHook(config),
         ...preHooks,
+        htmlEnvHook(config),
         devHtmlHook,
         ...normalHooks,
         ...postHooks,
@@ -76,49 +106,78 @@ function getHtmlFilename(url: string, server: ViteDevServer) {
   }
 }
 
-const startsWithSingleSlashRE = /^\/(?!\/)/
+function shouldPreTransform(url: string, config: ResolvedConfig) {
+  return (
+    !checkPublicFile(url, config) && (isJSRequest(url) || isCSSRequest(url))
+  )
+}
+
+const wordCharRE = /\w/
+
+function isBareRelative(url: string) {
+  return wordCharRE.test(url[0]) && !url.includes(':')
+}
+
+const isSrcSet = (attr: Token.Attribute) =>
+  attr.name === 'srcset' && attr.prefix === undefined
 const processNodeUrl = (
-  attr: Token.Attribute,
-  sourceCodeLocation: Token.Location,
-  s: MagicString,
+  url: string,
+  useSrcSetReplacer: boolean,
   config: ResolvedConfig,
   htmlPath: string,
   originalUrl?: string,
-  moduleGraph?: ModuleGraph,
-) => {
-  let url = attr.value || ''
-
-  if (moduleGraph) {
-    const mod = moduleGraph.urlToModuleMap.get(url)
-    if (mod && mod.lastHMRTimestamp > 0) {
-      url = injectQuery(url, `t=${mod.lastHMRTimestamp}`)
+  server?: ViteDevServer,
+  isClassicScriptLink?: boolean,
+): string => {
+  // prefix with base (dev only, base is never relative)
+  const replacer = (url: string) => {
+    if (server?.moduleGraph) {
+      const mod = server.moduleGraph.urlToModuleMap.get(url)
+      if (mod && mod.lastHMRTimestamp > 0) {
+        url = injectQuery(url, `t=${mod.lastHMRTimestamp}`)
+      }
     }
-  }
-  const devBase = config.base
-  if (startsWithSingleSlashRE.test(url)) {
-    // prefix with base (dev only, base is never relative)
-    const fullUrl = path.posix.join(devBase, url)
-    overwriteAttrValue(s, sourceCodeLocation, fullUrl)
-  } else if (
-    url.startsWith('.') &&
-    originalUrl &&
-    originalUrl !== '/' &&
-    htmlPath === '/index.html'
-  ) {
-    // prefix with base (dev only, base is never relative)
-    const replacer = (url: string) => path.posix.join(devBase, url)
 
-    // #3230 if some request url (localhost:3000/a/b) return to fallback html, the relative assets
-    // path will add `/a/` prefix, it will caused 404.
-    // rewrite before `./index.js` -> `localhost:5173/a/index.js`.
-    // rewrite after `../index.js` -> `localhost:5173/index.js`.
+    if (
+      (url[0] === '/' && url[1] !== '/') ||
+      // #3230 if some request url (localhost:3000/a/b) return to fallback html, the relative assets
+      // path will add `/a/` prefix, it will caused 404.
+      //
+      // skip if url contains `:` as it implies a url protocol or Windows path that we don't want to replace.
+      //
+      // rewrite `./index.js` -> `localhost:5173/a/index.js`.
+      // rewrite `../index.js` -> `localhost:5173/index.js`.
+      // rewrite `relative/index.js` -> `localhost:5173/a/relative/index.js`.
+      ((url[0] === '.' || isBareRelative(url)) &&
+        originalUrl &&
+        originalUrl !== '/' &&
+        htmlPath === '/index.html')
+    ) {
+      url = path.posix.join(config.base, url)
+    }
 
-    const processedUrl =
-      attr.name === 'srcset' && attr.prefix === undefined
-        ? processSrcSetSync(url, ({ url }) => replacer(url))
-        : replacer(url)
-    overwriteAttrValue(s, sourceCodeLocation, processedUrl)
+    if (server && !isClassicScriptLink && shouldPreTransform(url, config)) {
+      let preTransformUrl: string | undefined
+      if (url[0] === '/' && url[1] !== '/') {
+        preTransformUrl = url
+      } else if (url[0] === '.' || isBareRelative(url)) {
+        preTransformUrl = path.posix.join(
+          config.base,
+          path.posix.dirname(htmlPath),
+          url,
+        )
+      }
+      if (preTransformUrl) {
+        preTransformRequest(server, preTransformUrl, config.base)
+      }
+    }
+    return url
   }
+
+  const processedUrl = useSrcSetReplacer
+    ? processSrcSetSync(url, ({ url }) => replacer(url))
+    : replacer(url)
+  return processedUrl
 }
 const devHtmlHook: IndexHtmlTransformHook = async (
   html,
@@ -131,7 +190,7 @@ const devHtmlHook: IndexHtmlTransformHook = async (
   let proxyModuleUrl: string
 
   const trailingSlash = htmlPath.endsWith('/')
-  if (!trailingSlash && fs.existsSync(filename)) {
+  if (!trailingSlash && getFsUtils(config).existsSync(filename)) {
     proxyModulePath = htmlPath
     proxyModuleUrl = joinUrlSegments(base, htmlPath)
   } else {
@@ -147,11 +206,13 @@ const devHtmlHook: IndexHtmlTransformHook = async (
 
   const s = new MagicString(html)
   let inlineModuleIndex = -1
-  const proxyCacheUrl = cleanUrl(proxyModulePath).replace(
-    normalizePath(config.root),
-    '',
+  // The key to the proxyHtml cache is decoded, as it will be compared
+  // against decoded URLs by the HTML plugins.
+  const proxyCacheUrl = decodeURI(
+    cleanUrl(proxyModulePath).replace(normalizePath(config.root), ''),
   )
   const styleUrl: AssetNode[] = []
+  const inlineStyles: InlineStyleAttribute[] = []
 
   const addInlineModule = (
     node: DefaultTreeAdapterMap['element'],
@@ -164,13 +225,13 @@ const devHtmlHook: IndexHtmlTransformHook = async (
     const code = contentNode.value
 
     let map: SourceMapInput | undefined
-    if (!proxyModulePath.startsWith('\0')) {
+    if (proxyModulePath[0] !== '\0') {
       map = new MagicString(html)
         .snip(
           contentNode.sourceCodeLocation!.startOffset,
           contentNode.sourceCodeLocation!.endOffset,
         )
-        .generateMap({ hires: true })
+        .generateMap({ hires: 'boundary' })
       map.sources = [filename]
       map.file = filename
     }
@@ -191,6 +252,7 @@ const devHtmlHook: IndexHtmlTransformHook = async (
       node.sourceCodeLocation!.endOffset,
       `<script type="module" src="${modulePath}"></script>`,
     )
+    preTransformRequest(server!, modulePath, base)
   }
 
   await traverseHtml(html, filename, (node) => {
@@ -203,18 +265,51 @@ const devHtmlHook: IndexHtmlTransformHook = async (
       const { src, sourceCodeLocation, isModule } = getScriptInfo(node)
 
       if (src) {
-        processNodeUrl(
-          src,
-          sourceCodeLocation!,
-          s,
+        const processedUrl = processNodeUrl(
+          src.value,
+          isSrcSet(src),
           config,
           htmlPath,
           originalUrl,
-          moduleGraph,
+          server,
+          !isModule,
         )
+        if (processedUrl !== src.value) {
+          overwriteAttrValue(s, sourceCodeLocation!, processedUrl)
+        }
       } else if (isModule && node.childNodes.length) {
         addInlineModule(node, 'js')
+      } else if (node.childNodes.length) {
+        const scriptNode = node.childNodes[
+          node.childNodes.length - 1
+        ] as DefaultTreeAdapterMap['textNode']
+        for (const {
+          url,
+          start,
+          end,
+        } of extractImportExpressionFromClassicScript(scriptNode)) {
+          const processedUrl = processNodeUrl(
+            url,
+            false,
+            config,
+            htmlPath,
+            originalUrl,
+          )
+          if (processedUrl !== url) {
+            s.update(start, end, processedUrl)
+          }
+        }
       }
+    }
+
+    const inlineStyle = findNeedTransformStyleAttribute(node)
+    if (inlineStyle) {
+      inlineModuleIndex++
+      inlineStyles.push({
+        index: inlineModuleIndex,
+        location: inlineStyle.location!,
+        code: inlineStyle.attr.value,
+      })
     }
 
     if (node.nodeName === 'style' && node.childNodes.length) {
@@ -232,21 +327,27 @@ const devHtmlHook: IndexHtmlTransformHook = async (
       for (const p of node.attrs) {
         const attrKey = getAttrKey(p)
         if (p.value && assetAttrs.includes(attrKey)) {
-          processNodeUrl(
-            p,
-            node.sourceCodeLocation!.attrs![attrKey],
-            s,
+          const processedUrl = processNodeUrl(
+            p.value,
+            isSrcSet(p),
             config,
             htmlPath,
             originalUrl,
           )
+          if (processedUrl !== p.value) {
+            overwriteAttrValue(
+              s,
+              node.sourceCodeLocation!.attrs![attrKey],
+              processedUrl,
+            )
+          }
         }
       }
     }
   })
 
-  await Promise.all(
-    styleUrl.map(async ({ start, end, code }, index) => {
+  await Promise.all([
+    ...styleUrl.map(async ({ start, end, code }, index) => {
       const url = `${proxyModulePath}?html-proxy&direct&index=${index}.css`
 
       // ensure module in graph after successful load
@@ -254,9 +355,37 @@ const devHtmlHook: IndexHtmlTransformHook = async (
       ensureWatchedFile(watcher, mod.file, config.root)
 
       const result = await server!.pluginContainer.transform(code, mod.id!)
-      s.overwrite(start, end, result?.code || '')
+      let content = ''
+      if (result) {
+        if (result.map && 'version' in result.map) {
+          if (result.map.mappings) {
+            await injectSourcesContent(
+              result.map,
+              proxyModulePath,
+              config.logger,
+            )
+          }
+          content = getCodeWithSourcemap('css', result.code, result.map)
+        } else {
+          content = result.code
+        }
+      }
+      s.overwrite(start, end, content)
     }),
-  )
+    ...inlineStyles.map(async ({ index, location, code }) => {
+      // will transform with css plugin and cache result with css-post plugin
+      const url = `${proxyModulePath}?html-proxy&inline-css&style-attr&index=${index}.css`
+
+      const mod = await moduleGraph.ensureEntryFromUrl(url, false)
+      ensureWatchedFile(watcher, mod.file, config.root)
+
+      await server?.pluginContainer.transform(code, mod.id!)
+
+      const hash = getHash(cleanUrl(mod.id!))
+      const result = htmlProxyResult.get(`${hash}_${index}`)
+      overwriteAttrValue(s, location, result ?? '')
+    }),
+  ])
 
   html = s.toString()
 
@@ -276,8 +405,12 @@ const devHtmlHook: IndexHtmlTransformHook = async (
 }
 
 export function indexHtmlMiddleware(
-  server: ViteDevServer,
+  root: string,
+  server: ViteDevServer | PreviewServer,
 ): Connect.NextHandleFunction {
+  const isDev = isDevServer(server)
+  const fsUtils = getFsUtils(server.config)
+
   // Keep the named function. The name is visible in debug logs via `DEBUG=connect:dispatcher ...`
   return async function viteIndexHtmlMiddleware(req, res, next) {
     if (res.writableEnded) {
@@ -287,14 +420,24 @@ export function indexHtmlMiddleware(
     const url = req.url && cleanUrl(req.url)
     // htmlFallbackMiddleware appends '.html' to URLs
     if (url?.endsWith('.html') && req.headers['sec-fetch-dest'] !== 'script') {
-      const filename = getHtmlFilename(url, server)
-      if (fs.existsSync(filename)) {
+      let filePath: string
+      if (isDev && url.startsWith(FS_PREFIX)) {
+        filePath = decodeURIComponent(fsPathFromId(url))
+      } else {
+        filePath = path.join(root, decodeURIComponent(url))
+      }
+
+      if (fsUtils.existsSync(filePath)) {
+        const headers = isDev
+          ? server.config.server.headers
+          : server.config.preview.headers
+
         try {
-          let html = fs.readFileSync(filename, 'utf-8')
-          html = await server.transformIndexHtml(url, html, req.originalUrl)
-          return send(req, res, html, 'html', {
-            headers: server.config.server.headers,
-          })
+          let html = await fsp.readFile(filePath, 'utf-8')
+          if (isDev) {
+            html = await server.transformIndexHtml(url, html, req.originalUrl)
+          }
+          return send(req, res, html, 'html', { headers })
         } catch (e) {
           return next(e)
         }
@@ -302,4 +445,17 @@ export function indexHtmlMiddleware(
     }
     next()
   }
+}
+
+function preTransformRequest(server: ViteDevServer, url: string, base: string) {
+  if (!server.config.server.preTransformRequests) return
+
+  // transform all url as non-ssr as html includes client-side assets only
+  try {
+    url = unwrapId(stripBase(decodeURI(url), base))
+  } catch {
+    // ignore
+    return
+  }
+  server.warmupRequest(url)
 }

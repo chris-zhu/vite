@@ -65,6 +65,9 @@
 <h2>Import from dependency with optional peer dep</h2>
 <div class="dep-with-optional-peer-dep"></div>
 
+<h2>Import from dependency with optional peer dep submodule</h2>
+<div class="dep-with-optional-peer-dep-submodule"></div>
+
 <h2>Externalize known non-js files in optimize included dep</h2>
 <div class="externalize-known-non-js"></div>
 
@@ -96,6 +99,17 @@
 <h2>Non Optimized Module isn't duplicated</h2>
 <div class="non-optimized-module-is-not-duplicated"></div>
 
+<h2>Pre bundle css require</h2>
+<div class="css-require">css require</div>
+
+<h2>Pre bundle css modules require</h2>
+<div class="css-module-require">This should be red</div>
+
+<h2>Long file name import works</h2>
+<div class="long-file-name"></div>
+
+<script type="module" src="./long-file-name.js"></script>
+
 <script>
   function text(el, text) {
     document.querySelector(el).textContent = text
@@ -123,6 +137,11 @@
   }
 
   import '@vitejs/test-dep-cjs-with-assets'
+  import '@vitejs/test-dep-css-require'
+  import cssModuleRequire from '@vitejs/test-dep-css-require/mod.cjs'
+  document
+    .querySelector('.css-module-require')
+    .classList.add(cssModuleRequire.cssModuleRequire)
 
   import { env } from '@vitejs/test-dep-node-env'
   text('.node-env', env)
@@ -161,6 +180,7 @@
   )
 
   import './index.astro'
+  import './generics.vue'
 
   // All these imports should end up resolved to the same URL (same ?v= injected on them)
   import { add as addFromDirectAbsolutePath } from '/node_modules/@vitejs/test-dep-non-optimized/index.js'
@@ -191,6 +211,16 @@
   text('.dep-with-optional-peer-dep', callItself())
   // expect error as optional peer dep not installed
   callPeerDep()
+</script>
+
+<script type="module">
+  import {
+    callItself,
+    callPeerDepSubmodule,
+  } from '@vitejs/test-dep-with-optional-peer-dep-submodule'
+  text('.dep-with-optional-peer-dep-submodule', callItself())
+  // expect error as optional peer dep not installed
+  callPeerDepSubmodule()
 </script>
 
 <script type="module">

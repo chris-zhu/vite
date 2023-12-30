@@ -22,6 +22,10 @@ test('normal', async () => {
   )
 })
 
+test('named', async () => {
+  await untilUpdated(() => page.textContent('.pong-named'), 'namedWorker', true)
+})
+
 test('TS output', async () => {
   await untilUpdated(() => page.textContent('.pong-ts-output'), 'pong', true)
 })
@@ -30,8 +34,32 @@ test('inlined', async () => {
   await untilUpdated(() => page.textContent('.pong-inline'), 'pong', true)
 })
 
+test('named inlined', async () => {
+  await untilUpdated(
+    () => page.textContent('.pong-inline-named'),
+    'namedInlineWorker',
+    true,
+  )
+})
+
+test('import meta url', async () => {
+  await untilUpdated(
+    () => page.textContent('.pong-inline-url'),
+    /^(blob|http):/,
+    true,
+  )
+})
+
 test('shared worker', async () => {
   await untilUpdated(() => page.textContent('.tick-count'), 'pong', true)
+})
+
+test('named shared worker', async () => {
+  await untilUpdated(() => page.textContent('.tick-count-named'), 'pong', true)
+})
+
+test('inline shared worker', async () => {
+  await untilUpdated(() => page.textContent('.pong-shared-inline'), 'pong')
 })
 
 test('worker emitted and import.meta.url in nested worker (serve)', async () => {
@@ -52,12 +80,30 @@ test('worker emitted and import.meta.url in nested worker (serve)', async () => 
   )
 })
 
+test('deeply nested workers', async () => {
+  await untilUpdated(
+    async () => page.textContent('.deeply-nested-worker'),
+    /Hello\sfrom\sroot.*\/es\/.+deeply-nested-worker\.js/,
+    true,
+  )
+  await untilUpdated(
+    async () => page.textContent('.deeply-nested-second-worker'),
+    /Hello\sfrom\ssecond.*\/es\/.+second-worker\.js/,
+    true,
+  )
+  await untilUpdated(
+    async () => page.textContent('.deeply-nested-third-worker'),
+    /Hello\sfrom\sthird.*\/es\/.+third-worker\.js/,
+    true,
+  )
+})
+
 describe.runIf(isBuild)('build', () => {
   // assert correct files
   test('inlined code generation', async () => {
     const assetsDir = path.resolve(testDir, 'dist/es/assets')
     const files = fs.readdirSync(assetsDir)
-    expect(files.length).toBe(28)
+    expect(files.length).toBe(32)
     const index = files.find((f) => f.includes('main-module'))
     const content = fs.readFileSync(path.resolve(assetsDir, index), 'utf-8')
     const worker = files.find((f) => f.includes('my-worker'))
@@ -67,14 +113,21 @@ describe.runIf(isBuild)('build', () => {
     )
 
     // worker should have all imports resolved and no exports
-    expect(workerContent).not.toMatch(`import`)
+    expect(workerContent).not.toMatch(/import[^.]/)
     expect(workerContent).not.toMatch(`export`)
     // chunk
     expect(content).toMatch(`new Worker("/es/assets`)
     expect(content).toMatch(`new SharedWorker("/es/assets`)
-    // inlined
+    // inlined worker
     expect(content).toMatch(`(window.URL||window.webkitURL).createObjectURL`)
     expect(content).toMatch(`window.Blob`)
+    expect(content).toMatch(
+      /try\{if\(\w+=\w+&&\(window\.URL\|\|window\.webkitURL\)\.createObjectURL\(\w+\),!\w+\)throw""/,
+    )
+    // inlined shared worker
+    expect(content).toMatch(
+      `return new SharedWorker("data:application/javascript;base64,"+`,
+    )
   })
 
   test('worker emitted and import.meta.url in nested worker (build)', async () => {
@@ -103,6 +156,11 @@ test('module worker', async () => {
     true,
   )
   await untilUpdated(
+    () => page.textContent('.worker-import-meta-url-without-extension'),
+    'A string',
+    true,
+  )
+  await untilUpdated(
     () => page.textContent('.shared-worker-import-meta-url'),
     'A string',
     true,
@@ -114,6 +172,10 @@ test('classic worker', async () => {
     () => page.textContent('.classic-worker'),
     'A classic',
     true,
+  )
+  await untilUpdated(
+    () => page.textContent('.classic-worker-import'),
+    '[success] classic-esm',
   )
   await untilUpdated(
     () => page.textContent('.classic-shared-worker'),

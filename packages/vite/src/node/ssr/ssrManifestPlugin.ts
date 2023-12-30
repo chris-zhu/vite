@@ -1,12 +1,20 @@
 import { basename, dirname, join, relative } from 'node:path'
 import { parse as parseImports } from 'es-module-lexer'
-import type { ImportSpecifier } from 'es-module-lexer'
+import type {
+  ParseError as EsModuleLexerParseError,
+  ImportSpecifier,
+} from 'es-module-lexer'
 import type { OutputChunk } from 'rollup'
 import jsonStableStringify from 'json-stable-stringify'
 import type { ResolvedConfig } from '..'
 import type { Plugin } from '../plugin'
 import { preloadMethod } from '../plugins/importAnalysisBuild'
-import { joinUrlSegments, normalizePath } from '../utils'
+import {
+  generateCodeFrame,
+  joinUrlSegments,
+  normalizePath,
+  numberToPos,
+} from '../utils'
 
 export function ssrManifestPlugin(config: ResolvedConfig): Plugin {
   // module id => preload assets mapping
@@ -38,11 +46,21 @@ export function ssrManifestPlugin(config: ResolvedConfig): Plugin {
           if (chunk.code.includes(preloadMethod)) {
             // generate css deps map
             const code = chunk.code
-            let imports: ImportSpecifier[]
+            let imports: ImportSpecifier[] = []
             try {
               imports = parseImports(code)[0].filter((i) => i.n && i.d > -1)
-            } catch (e: any) {
-              this.error(e, e.idx)
+            } catch (_e: unknown) {
+              const e = _e as EsModuleLexerParseError
+              const loc = numberToPos(code, e.idx)
+              this.error({
+                name: e.name,
+                message: e.message,
+                stack: e.stack,
+                cause: e.cause,
+                pos: e.idx,
+                loc: { ...loc, file: chunk.fileName },
+                frame: generateCodeFrame(code, loc),
+              })
             }
             if (imports.length) {
               for (let index = 0; index < imports.length; index++) {
@@ -80,7 +98,7 @@ export function ssrManifestPlugin(config: ResolvedConfig): Plugin {
         fileName:
           typeof config.build.ssrManifest === 'string'
             ? config.build.ssrManifest
-            : 'ssr-manifest.json',
+            : '.vite/ssr-manifest.json',
         type: 'asset',
         source: jsonStableStringify(ssrManifest, { space: 2 }),
       })
