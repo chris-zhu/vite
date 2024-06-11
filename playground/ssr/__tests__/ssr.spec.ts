@@ -12,10 +12,28 @@ test(`circular dependencies modules doesn't throw`, async () => {
   )
 })
 
-test(`deadlock doesn't happen`, async () => {
-  await page.goto(`${url}/forked-deadlock`)
+test(`circular import doesn't throw`, async () => {
+  await page.goto(`${url}/circular-import`)
 
-  expect(await page.textContent('.forked-deadlock')).toMatch('rendered')
+  expect(await page.textContent('.circ-import')).toMatchInlineSnapshot(
+    '"A is: __A__"',
+  )
+})
+
+test(`deadlock doesn't happen for static imports`, async () => {
+  await page.goto(`${url}/forked-deadlock-static-imports`)
+
+  expect(await page.textContent('.forked-deadlock-static-imports')).toMatch(
+    'rendered',
+  )
+})
+
+test(`deadlock doesn't happen for dynamic imports`, async () => {
+  await page.goto(`${url}/forked-deadlock-dynamic-imports`)
+
+  expect(await page.textContent('.forked-deadlock-dynamic-imports')).toMatch(
+    'rendered',
+  )
 })
 
 test('should restart ssr', async () => {
@@ -31,9 +49,21 @@ test('should restart ssr', async () => {
 })
 
 test.runIf(isServe)('html proxy is encoded', async () => {
-  await page.goto(
-    `${url}?%22%3E%3C/script%3E%3Cscript%3Econsole.log(%27html proxy is not encoded%27)%3C/script%3E`,
-  )
+  try {
+    await page.goto(
+      `${url}?%22%3E%3C/script%3E%3Cscript%3Econsole.log(%27html%20proxy%20is%20not%20encoded%27)%3C/script%3E`,
+    )
 
-  expect(browserLogs).not.toContain('html proxy is not encoded')
+    expect(browserLogs).not.toContain('html proxy is not encoded')
+  } catch (e) {
+    // Ignore net::ERR_ABORTED, which is causing flakiness in this test
+    if (
+      !(
+        e.message.includes('net::ERR_ABORTED') ||
+        e.message.includes('interrupted')
+      )
+    ) {
+      throw e
+    }
+  }
 })

@@ -15,6 +15,8 @@ import {
   getScriptInfo,
   htmlEnvHook,
   htmlProxyResult,
+  injectCspNonceMetaTagHook,
+  injectNonceAttributeTagHook,
   nodeIsElement,
   overwriteAttrValue,
   postImportMapHook,
@@ -26,7 +28,6 @@ import type { PreviewServer, ResolvedConfig, ViteDevServer } from '../..'
 import { send } from '../send'
 import { CLIENT_PUBLIC_PATH, FS_PREFIX } from '../../constants'
 import {
-  cleanUrl,
   ensureWatchedFile,
   fsPathFromId,
   getHash,
@@ -37,13 +38,12 @@ import {
   normalizePath,
   processSrcSetSync,
   stripBase,
-  unwrapId,
-  wrapId,
 } from '../../utils'
 import { getFsUtils } from '../../fsUtils'
 import { checkPublicFile } from '../../publicDir'
 import { isCSSRequest } from '../../plugins/css'
 import { getCodeWithSourcemap, injectSourcesContent } from '../sourcemap'
+import { cleanUrl, unwrapId, wrapId } from '../../../shared/utils'
 
 interface AssetNode {
   start: number
@@ -69,30 +69,29 @@ export function createDevHtmlTransformFn(
     config.plugins,
     config.logger,
   )
+  const transformHooks = [
+    preImportMapHook(config),
+    injectCspNonceMetaTagHook(config),
+    ...preHooks,
+    htmlEnvHook(config),
+    devHtmlHook,
+    ...normalHooks,
+    ...postHooks,
+    injectNonceAttributeTagHook(config),
+    postImportMapHook(),
+  ]
   return (
     server: ViteDevServer,
     url: string,
     html: string,
     originalUrl?: string,
   ): Promise<string> => {
-    return applyHtmlTransforms(
-      html,
-      [
-        preImportMapHook(config),
-        ...preHooks,
-        htmlEnvHook(config),
-        devHtmlHook,
-        ...normalHooks,
-        ...postHooks,
-        postImportMapHook(),
-      ],
-      {
-        path: url,
-        filename: getHtmlFilename(url, server),
-        server,
-        originalUrl,
-      },
-    )
+    return applyHtmlTransforms(html, transformHooks, {
+      path: url,
+      filename: getHtmlFilename(url, server),
+      server,
+      originalUrl,
+    })
   }
 }
 
@@ -192,7 +191,7 @@ const devHtmlHook: IndexHtmlTransformHook = async (
   const trailingSlash = htmlPath.endsWith('/')
   if (!trailingSlash && getFsUtils(config).existsSync(filename)) {
     proxyModulePath = htmlPath
-    proxyModuleUrl = joinUrlSegments(base, htmlPath)
+    proxyModuleUrl = proxyModulePath
   } else {
     // There are users of vite.transformIndexHtml calling it with url '/'
     // for SSR integrations #7993, filename is root for this case
@@ -203,6 +202,7 @@ const devHtmlHook: IndexHtmlTransformHook = async (
     proxyModulePath = `\0${validPath}`
     proxyModuleUrl = wrapId(proxyModulePath)
   }
+  proxyModuleUrl = joinUrlSegments(base, proxyModuleUrl)
 
   const s = new MagicString(html)
   let inlineModuleIndex = -1

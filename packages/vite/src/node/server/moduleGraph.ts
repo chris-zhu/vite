@@ -2,12 +2,12 @@ import { extname } from 'node:path'
 import type { ModuleInfo, PartialResolvedId } from 'rollup'
 import { isDirectCSSRequest } from '../plugins/css'
 import {
-  cleanUrl,
   normalizePath,
   removeImportQuery,
   removeTimestampQuery,
 } from '../utils'
 import { FS_PREFIX } from '../constants'
+import { cleanUrl } from '../../shared/utils'
 import type { TransformResult } from './transformRequest'
 
 export class ModuleNode {
@@ -35,6 +35,13 @@ export class ModuleNode {
   ssrModule: Record<string, any> | null = null
   ssrError: Error | null = null
   lastHMRTimestamp = 0
+  /**
+   * `import.meta.hot.invalidate` is called by the client.
+   * If there's multiple clients, multiple `invalidate` request is received.
+   * This property is used to dedupe those request to avoid multiple updates happening.
+   * @internal
+   */
+  lastHMRInvalidationReceived = false
   lastInvalidationTimestamp = 0
   /**
    * If the module only needs to update its imports timestamp (e.g. within an HMR chain),
@@ -88,6 +95,7 @@ export type ResolvedUrl = [
 export class ModuleGraph {
   urlToModuleMap = new Map<string, ModuleNode>()
   idToModuleMap = new Map<string, ModuleNode>()
+  etagToModuleMap = new Map<string, ModuleNode>()
   // a single file may corresponds to multiple modules with different queries
   fileToModulesMap = new Map<string, Set<ModuleNode>>()
   safeModulesPath = new Set<string>()
@@ -106,6 +114,9 @@ export class ModuleGraph {
     string,
     Promise<ModuleNode> | ModuleNode
   >()
+
+  /** @internal */
+  _hasResolveFailedErrorModules = new Set<ModuleNode>()
 
   constructor(
     private resolveId: (
@@ -147,6 +158,17 @@ export class ModuleGraph {
     }
   }
 
+  onFileDelete(file: string): void {
+    const mods = this.getModulesByFile(file)
+    if (mods) {
+      mods.forEach((mod) => {
+        mod.importedModules.forEach((importedMod) => {
+          importedMod.importers.delete(mod)
+        })
+      })
+    }
+  }
+
   invalidateModule(
     mod: ModuleNode,
     seen: Set<ModuleNode> = new Set(),
@@ -184,6 +206,7 @@ export class ModuleGraph {
 
     if (isHmr) {
       mod.lastHMRTimestamp = timestamp
+      mod.lastHMRInvalidationReceived = false
     } else {
       // Save the timestamp for this invalidation, so we can avoid caching the result of possible already started
       // processing being done for this module
@@ -192,6 +215,9 @@ export class ModuleGraph {
 
     // Don't invalidate mod.info and mod.meta, as they are part of the processing pipeline
     // Invalidating the transform result is enough to ensure this module is re-processed next time it is requested
+    const etag = mod.transformResult?.etag
+    if (etag) this.etagToModuleMap.delete(etag)
+
     mod.transformResult = null
     mod.ssrTransformResult = null
     mod.ssrModule = null
@@ -214,6 +240,8 @@ export class ModuleGraph {
         )
       }
     })
+
+    this._hasResolveFailedErrorModules.delete(mod)
   }
 
   invalidateAll(): void {
@@ -417,6 +445,27 @@ export class ModuleGraph {
       return [mod.url, mod.id, mod.meta]
     }
     return this._resolveUrl(url, ssr)
+  }
+
+  updateModuleTransformResult(
+    mod: ModuleNode,
+    result: TransformResult | null,
+    ssr: boolean,
+  ): void {
+    if (ssr) {
+      mod.ssrTransformResult = result
+    } else {
+      const prevEtag = mod.transformResult?.etag
+      if (prevEtag) this.etagToModuleMap.delete(prevEtag)
+
+      mod.transformResult = result
+
+      if (result?.etag) this.etagToModuleMap.set(result.etag, mod)
+    }
+  }
+
+  getModuleByEtag(etag: string): ModuleNode | undefined {
+    return this.etagToModuleMap.get(etag)
   }
 
   /**

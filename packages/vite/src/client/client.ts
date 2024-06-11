@@ -30,7 +30,6 @@ const socketHost = `${__HMR_HOSTNAME__ || importMetaUrl.hostname}:${
 }${__HMR_BASE__}`
 const directSocketHost = __HMR_DIRECT_TARGET__
 const base = __BASE__ || '/'
-const messageBuffer: string[] = []
 
 let socket: WebSocket
 try {
@@ -103,16 +102,18 @@ function setupWebSocket(
 
     notifyListeners('vite:ws:disconnect', { webSocket: socket })
 
-    console.log(`[vite] server connection lost. polling for restart...`)
-    await waitForSuccessfulPing(protocol, hostAndPath)
-    location.reload()
+    if (hasDocument) {
+      console.log(`[vite] server connection lost. Polling for restart...`)
+      await waitForSuccessfulPing(protocol, hostAndPath)
+      location.reload()
+    }
   })
 
   return socket
 }
 
 function cleanUrl(pathname: string): string {
-  const url = new URL(pathname, location.toString())
+  const url = new URL(pathname, 'http://vitejs.dev')
   url.searchParams.delete('direct')
   return url.pathname + url.search
 }
@@ -134,27 +135,45 @@ const debounceReload = (time: number) => {
 }
 const pageReload = debounceReload(50)
 
-const hmrClient = new HMRClient(console, async function importUpdatedModule({
-  acceptedPath,
-  timestamp,
-  explicitImportRequired,
-}) {
-  const [acceptedPathWithoutQuery, query] = acceptedPath.split(`?`)
-  return await import(
-    /* @vite-ignore */
-    base +
-      acceptedPathWithoutQuery.slice(1) +
-      `?${explicitImportRequired ? 'import&' : ''}t=${timestamp}${
-        query ? `&${query}` : ''
-      }`
-  )
-})
+const hmrClient = new HMRClient(
+  console,
+  {
+    isReady: () => socket && socket.readyState === 1,
+    send: (message) => socket.send(message),
+  },
+  async function importUpdatedModule({
+    acceptedPath,
+    timestamp,
+    explicitImportRequired,
+    isWithinCircularImport,
+  }) {
+    const [acceptedPathWithoutQuery, query] = acceptedPath.split(`?`)
+    const importPromise = import(
+      /* @vite-ignore */
+      base +
+        acceptedPathWithoutQuery.slice(1) +
+        `?${explicitImportRequired ? 'import&' : ''}t=${timestamp}${
+          query ? `&${query}` : ''
+        }`
+    )
+    if (isWithinCircularImport) {
+      importPromise.catch(() => {
+        console.info(
+          `[hmr] ${acceptedPath} failed to apply HMR as it's within a circular import. Reloading page to reset the execution order. ` +
+            `To debug and break the circular import, you can run \`vite --debug hmr\` to log the circular dependency path if a file change triggered it.`,
+        )
+        pageReload()
+      })
+    }
+    return await importPromise
+  },
+)
 
 async function handleMessage(payload: HMRPayload) {
   switch (payload.type) {
     case 'connected':
       console.debug(`[vite] connected.`)
-      sendMessageBuffer()
+      hmrClient.messenger.flush()
       // proxy(nginx, docker) hmr ws maybe caused timeout,
       // so send ping package let ws keep alive.
       setInterval(() => {
@@ -165,21 +184,25 @@ async function handleMessage(payload: HMRPayload) {
       break
     case 'update':
       notifyListeners('vite:beforeUpdate', payload)
-      // if this is the first update and there's already an error overlay, it
-      // means the page opened with existing server compile error and the whole
-      // module script failed to load (since one of the nested imports is 500).
-      // in this case a normal update won't work and a full reload is needed.
-      if (isFirstUpdate && hasErrorOverlay()) {
-        window.location.reload()
-        return
-      } else {
-        clearErrorOverlay()
-        isFirstUpdate = false
+      if (hasDocument) {
+        // if this is the first update and there's already an error overlay, it
+        // means the page opened with existing server compile error and the whole
+        // module script failed to load (since one of the nested imports is 500).
+        // in this case a normal update won't work and a full reload is needed.
+        if (isFirstUpdate && hasErrorOverlay()) {
+          window.location.reload()
+          return
+        } else {
+          if (enableOverlay) {
+            clearErrorOverlay()
+          }
+          isFirstUpdate = false
+        }
       }
       await Promise.all(
         payload.updates.map(async (update): Promise<void> => {
           if (update.type === 'js-update') {
-            return queueUpdate(hmrClient.fetchUpdate(update))
+            return hmrClient.queueUpdate(update)
           }
 
           // css-update
@@ -232,36 +255,40 @@ async function handleMessage(payload: HMRPayload) {
     }
     case 'full-reload':
       notifyListeners('vite:beforeFullReload', payload)
-      if (payload.path && payload.path.endsWith('.html')) {
-        // if html file is edited, only reload the page if the browser is
-        // currently on that page.
-        const pagePath = decodeURI(location.pathname)
-        const payloadPath = base + payload.path.slice(1)
-        if (
-          pagePath === payloadPath ||
-          payload.path === '/index.html' ||
-          (pagePath.endsWith('/') && pagePath + 'index.html' === payloadPath)
-        ) {
+      if (hasDocument) {
+        if (payload.path && payload.path.endsWith('.html')) {
+          // if html file is edited, only reload the page if the browser is
+          // currently on that page.
+          const pagePath = decodeURI(location.pathname)
+          const payloadPath = base + payload.path.slice(1)
+          if (
+            pagePath === payloadPath ||
+            payload.path === '/index.html' ||
+            (pagePath.endsWith('/') && pagePath + 'index.html' === payloadPath)
+          ) {
+            pageReload()
+          }
+          return
+        } else {
           pageReload()
         }
-        return
-      } else {
-        pageReload()
       }
       break
     case 'prune':
       notifyListeners('vite:beforePrune', payload)
-      hmrClient.prunePaths(payload.paths)
+      await hmrClient.prunePaths(payload.paths)
       break
     case 'error': {
       notifyListeners('vite:error', payload)
-      const err = payload.err
-      if (enableOverlay) {
-        createErrorOverlay(err)
-      } else {
-        console.error(
-          `[vite] Internal Server Error\n${err.message}\n${err.stack}`,
-        )
+      if (hasDocument) {
+        const err = payload.err
+        if (enableOverlay) {
+          createErrorOverlay(err)
+        } else {
+          console.error(
+            `[vite] Internal Server Error\n${err.message}\n${err.stack}`,
+          )
+        }
       }
       break
     }
@@ -281,6 +308,7 @@ function notifyListeners(event: string, data: any): void {
 }
 
 const enableOverlay = __HMR_ENABLE_OVERLAY__
+const hasDocument = 'document' in globalThis
 
 function createErrorOverlay(err: ErrorPayload['err']) {
   clearErrorOverlay()
@@ -293,26 +321,6 @@ function clearErrorOverlay() {
 
 function hasErrorOverlay() {
   return document.querySelectorAll(overlayId).length
-}
-
-let pending = false
-let queued: Promise<(() => void) | undefined>[] = []
-
-/**
- * buffer multiple hot updates triggered by the same src change
- * so that they are invoked in the same order they were sent.
- * (otherwise the order may be inconsistent because of the http request round trip)
- */
-async function queueUpdate(p: Promise<(() => void) | undefined>) {
-  queued.push(p)
-  if (!pending) {
-    pending = true
-    await Promise.resolve()
-    pending = false
-    const loading = [...queued]
-    queued = []
-    ;(await Promise.all(loading)).forEach((fn) => fn && fn())
-  }
 }
 
 async function waitForSuccessfulPing(
@@ -386,6 +394,11 @@ if ('document' in globalThis) {
     })
 }
 
+const cspNonce =
+  'document' in globalThis
+    ? document.querySelector<HTMLMetaElement>('meta[property=csp-nonce]')?.nonce
+    : undefined
+
 // all css imports should be inserted at the same position
 // because after build it will be a single css file
 let lastInsertedStyle: HTMLStyleElement | undefined
@@ -397,6 +410,9 @@ export function updateStyle(id: string, content: string): void {
     style.setAttribute('type', 'text/css')
     style.setAttribute('data-vite-dev-id', id)
     style.textContent = content
+    if (cspNonce) {
+      style.setAttribute('nonce', cspNonce)
+    }
 
     if (!lastInsertedStyle) {
       document.head.appendChild(style)
@@ -424,22 +440,8 @@ export function removeStyle(id: string): void {
   }
 }
 
-function sendMessageBuffer() {
-  if (socket.readyState === 1) {
-    messageBuffer.forEach((msg) => socket.send(msg))
-    messageBuffer.length = 0
-  }
-}
-
 export function createHotContext(ownerPath: string): ViteHotContext {
-  return new HMRContext(ownerPath, hmrClient, {
-    addBuffer(message) {
-      messageBuffer.push(message)
-    },
-    send() {
-      sendMessageBuffer()
-    },
-  })
+  return new HMRContext(hmrClient, ownerPath)
 }
 
 /**
@@ -452,7 +454,7 @@ export function injectQuery(url: string, queryToInject: string): string {
   }
 
   // can't use pathname from URL since it may be relative like ../
-  const pathname = url.replace(/[?#].*$/s, '')
+  const pathname = url.replace(/[?#].*$/, '')
   const { search, hash } = new URL(url, 'http://vitejs.dev')
 
   return `${pathname}?${queryToInject}${search ? `&` + search.slice(1) : ''}${

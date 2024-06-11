@@ -13,14 +13,16 @@ import { stripLiteral } from 'strip-literal'
 import type { Plugin } from '../plugin'
 import type { ViteDevServer } from '../server'
 import {
-  cleanUrl,
+  encodeURIPath,
   generateCodeFrame,
   getHash,
   isDataUrl,
   isExternalUrl,
   normalizePath,
+  partialEncodeURIPath,
   processSrcSet,
   removeLeadingSlash,
+  unique,
   urlCanParse,
 } from '../utils'
 import type { ResolvedConfig } from '../config'
@@ -28,6 +30,7 @@ import { checkPublicFile } from '../publicDir'
 import { toOutputFilePathInHtml } from '../build'
 import { resolveEnvPrefix } from '../env'
 import type { Logger } from '../logger'
+import { cleanUrl } from '../../shared/utils'
 import {
   assetUrlRE,
   getPublicAssetFilename,
@@ -45,6 +48,8 @@ interface ScriptAssetsUrl {
 
 const htmlProxyRE =
   /\?html-proxy=?(?:&inline-css)?(?:&style-attr)?&index=(\d+)\.(js|css)$/
+const isHtmlProxyRE = /\?html-proxy\b/
+
 const inlineCSSRE = /__VITE_INLINE_CSS__([a-z\d]{8}_\d+)__/g
 // Do not allow preceding '.', but do allow preceding '...' for spread operations
 const inlineImportRE =
@@ -63,7 +68,7 @@ const importMapAppendRE = new RegExp(
   'i',
 )
 
-export const isHTMLProxy = (id: string): boolean => htmlProxyRE.test(id)
+export const isHTMLProxy = (id: string): boolean => isHtmlProxyRE.test(id)
 
 export const isHTMLRequest = (request: string): boolean =>
   htmlLangRE.test(request)
@@ -88,7 +93,7 @@ export function htmlInlineProxyPlugin(config: ResolvedConfig): Plugin {
     name: 'vite:html-inline-proxy',
 
     resolveId(id) {
-      if (htmlProxyRE.test(id)) {
+      if (isHTMLProxy(id)) {
         return id
       }
     },
@@ -306,8 +311,10 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
     config.plugins,
     config.logger,
   )
+  preHooks.unshift(injectCspNonceMetaTagHook(config))
   preHooks.unshift(preImportMapHook(config))
   preHooks.push(htmlEnvHook(config))
+  postHooks.push(injectNonceAttributeTagHook(config))
   postHooks.push(postImportMapHook())
   const processedHtml = new Map<string, string>()
 
@@ -322,10 +329,8 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
 
     async transform(html, id) {
       if (id.endsWith('.html')) {
-        const relativeUrlPath = path.posix.relative(
-          config.root,
-          normalizePath(id),
-        )
+        id = normalizePath(id)
+        const relativeUrlPath = path.posix.relative(config.root, id)
         const publicPath = `/${relativeUrlPath}`
         const publicBase = getBaseInHTML(relativeUrlPath, config)
 
@@ -345,18 +350,13 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
         const nodeStartWithLeadingWhitespace = (
           node: DefaultTreeAdapterMap['node'],
         ) => {
-          if (node.sourceCodeLocation!.startOffset === 0)
-            return node.sourceCodeLocation!.startOffset
+          const startOffset = node.sourceCodeLocation!.startOffset
+          if (startOffset === 0) return 0
 
           // Gets the offset for the start of the line including the
           // newline trailing the previous node
           const lineStartOffset =
-            node.sourceCodeLocation!.startOffset -
-            node.sourceCodeLocation!.startCol
-          const line = s.slice(
-            Math.max(0, lineStartOffset),
-            node.sourceCodeLocation!.startOffset,
-          )
+            startOffset - node.sourceCodeLocation!.startCol
 
           // <previous-line-node></previous-line-node>
           // <target-node></target-node>
@@ -369,9 +369,16 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
           //
           // However, if there is content between our target node start and the
           // previous newline, we cannot strip it out without risking content deletion.
-          return line.trim()
-            ? node.sourceCodeLocation!.startOffset
-            : lineStartOffset
+          let isLineEmpty = false
+          try {
+            const line = s.slice(Math.max(0, lineStartOffset), startOffset)
+            isLineEmpty = !line.trim()
+          } catch {
+            // magic-string may throw if there's some content removed in the sliced string,
+            // which we ignore and assume the line is not empty
+          }
+
+          return isLineEmpty ? lineStartOffset : startOffset
         }
 
         // pre-transform
@@ -434,7 +441,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
               overwriteAttrValue(
                 s,
                 sourceCodeLocation!,
-                toOutputPublicFilePath(url),
+                partialEncodeURIPath(toOutputPublicFilePath(url)),
               )
             }
 
@@ -486,22 +493,24 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
                 if (attrKey === 'srcset') {
                   assetUrlsPromises.push(
                     (async () => {
-                      const processedUrl = await processSrcSet(
+                      const processedEncodedUrl = await processSrcSet(
                         p.value,
                         async ({ url }) => {
                           const decodedUrl = decodeURI(url)
                           if (!isExcludedUrl(decodedUrl)) {
                             const result = await processAssetUrl(url)
-                            return result !== decodedUrl ? result : url
+                            return result !== decodedUrl
+                              ? encodeURIPath(result)
+                              : url
                           }
                           return url
                         },
                       )
-                      if (processedUrl !== p.value) {
+                      if (processedEncodedUrl !== p.value) {
                         overwriteAttrValue(
                           s,
                           getAttrSourceCodeLocation(node, attrKey),
-                          processedUrl,
+                          processedEncodedUrl,
                         )
                       }
                     })(),
@@ -512,7 +521,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
                     overwriteAttrValue(
                       s,
                       getAttrSourceCodeLocation(node, attrKey),
-                      toOutputPublicFilePath(url),
+                      partialEncodeURIPath(toOutputPublicFilePath(url)),
                     )
                   } else if (!isExcludedUrl(url)) {
                     if (
@@ -541,11 +550,9 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
                         node.attrs.some(
                           (p) =>
                             p.name === 'rel' &&
-                            p.value
-                              .split(spaceRe)
-                              .some((v) =>
-                                noInlineLinkRels.has(v.toLowerCase()),
-                              ),
+                            parseRelAttr(p.value).some((v) =>
+                              noInlineLinkRels.has(v),
+                            ),
                         )
                       const shouldInline = isNoInlineLink ? false : undefined
                       assetUrlsPromises.push(
@@ -558,7 +565,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
                             overwriteAttrValue(
                               s,
                               getAttrSourceCodeLocation(node, attrKey),
-                              processedUrl,
+                              partialEncodeURIPath(processedUrl),
                             )
                           }
                         })(),
@@ -631,9 +638,17 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
         // emit <script>import("./aaa")</script> asset
         for (const { start, end, url } of scriptUrls) {
           if (checkPublicFile(url, config)) {
-            s.update(start, end, toOutputPublicFilePath(url))
+            s.update(
+              start,
+              end,
+              partialEncodeURIPath(toOutputPublicFilePath(url)),
+            )
           } else if (!isExcludedUrl(url)) {
-            s.update(start, end, await urlToBuiltUrl(url, id, config, this))
+            s.update(
+              start,
+              end,
+              partialEncodeURIPath(await urlToBuiltUrl(url, id, config, this)),
+            )
           }
         }
 
@@ -760,11 +775,8 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
         return tags
       }
 
-      for (const [id, html] of processedHtml) {
-        const relativeUrlPath = path.posix.relative(
-          config.root,
-          normalizePath(id),
-        )
+      for (const [normalizedId, html] of processedHtml) {
+        const relativeUrlPath = path.posix.relative(config.root, normalizedId)
         const assetsBase = getBaseInHTML(relativeUrlPath, config)
         const toOutputFilePath = (
           filename: string,
@@ -790,7 +802,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
         const toOutputPublicAssetFilePath = (filename: string) =>
           toOutputFilePath(filename, 'public')
 
-        const isAsync = isAsyncScriptMap.get(config)!.get(id)!
+        const isAsync = isAsyncScriptMap.get(config)!.get(normalizedId)!
 
         let result = html
 
@@ -799,7 +811,8 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
           (chunk) =>
             chunk.type === 'chunk' &&
             chunk.isEntry &&
-            chunk.facadeModuleId === id,
+            chunk.facadeModuleId &&
+            normalizePath(chunk.facadeModuleId) === normalizedId,
         ) as OutputChunk | undefined
 
         let canInlineEntry = false
@@ -884,7 +897,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
           [...normalHooks, ...postHooks],
           {
             path: '/' + relativeUrlPath,
-            filename: id,
+            filename: normalizedId,
             bundle,
             chunk,
           },
@@ -895,7 +908,7 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
           if (chunk) {
             chunk.viteMetadata!.importedAssets.add(cleanUrl(file))
           }
-          return toOutputAssetFilePath(file) + postfix
+          return encodeURIPath(toOutputAssetFilePath(file)) + postfix
         })
 
         result = result.replace(publicAssetUrlRE, (_, fileHash) => {
@@ -903,16 +916,20 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
             getPublicAssetFilename(fileHash, config)!,
           )
 
-          return urlCanParse(publicAssetPath)
-            ? publicAssetPath
-            : normalizePath(publicAssetPath)
+          return encodeURIPath(
+            urlCanParse(publicAssetPath)
+              ? publicAssetPath
+              : normalizePath(publicAssetPath),
+          )
         })
 
         if (chunk && canInlineEntry) {
           inlineEntryChunk.add(chunk.fileName)
         }
 
-        const shortEmitName = normalizePath(path.relative(config.root, id))
+        const shortEmitName = normalizePath(
+          path.relative(config.root, normalizedId),
+        )
         this.emitFile({
           type: 'asset',
           fileName: shortEmitName,
@@ -926,6 +943,10 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
       }
     },
   }
+}
+
+export function parseRelAttr(attr: string): string[] {
+  return attr.split(spaceRe).map((v) => v.toLowerCase())
 }
 
 // <tag style="... url(...) or image-set(...) ..."></tag>
@@ -1077,6 +1098,24 @@ export function postImportMapHook(): IndexHtmlTransformHook {
   }
 }
 
+export function injectCspNonceMetaTagHook(
+  config: ResolvedConfig,
+): IndexHtmlTransformHook {
+  return () => {
+    if (!config.html?.cspNonce) return
+
+    return [
+      {
+        tag: 'meta',
+        injectTo: 'head',
+        // use nonce attribute so that it's hidden
+        // https://developer.mozilla.org/en-US/docs/Web/HTML/Global_attributes/nonce#accessing_nonces_and_nonce_hiding
+        attrs: { property: 'csp-nonce', nonce: config.html.cspNonce },
+      },
+    ]
+  }
+}
+
 /**
  * Support `%ENV_NAME%` syntax in html files
  */
@@ -1123,6 +1162,53 @@ export function htmlEnvHook(config: ResolvedConfig): IndexHtmlTransformHook {
         return text
       }
     })
+  }
+}
+
+export function injectNonceAttributeTagHook(
+  config: ResolvedConfig,
+): IndexHtmlTransformHook {
+  const processRelType = new Set(['stylesheet', 'modulepreload', 'preload'])
+
+  return async (html, { filename }) => {
+    const nonce = config.html?.cspNonce
+    if (!nonce) return
+
+    const s = new MagicString(html)
+
+    await traverseHtml(html, filename, (node) => {
+      if (!nodeIsElement(node)) {
+        return
+      }
+
+      const { nodeName, attrs, sourceCodeLocation } = node
+
+      if (
+        nodeName === 'script' ||
+        nodeName === 'style' ||
+        (nodeName === 'link' &&
+          attrs.some(
+            (attr) =>
+              attr.name === 'rel' &&
+              parseRelAttr(attr.value).some((a) => processRelType.has(a)),
+          ))
+      ) {
+        // If we already have a nonce attribute, we don't need to add another one
+        if (attrs.some(({ name }) => name === 'nonce')) {
+          return
+        }
+
+        const startTagEndOffset = sourceCodeLocation!.startTag!.endOffset
+
+        // if the closing of the start tag includes a `/`, the offset should be 2 so the nonce
+        // is appended prior to the `/`
+        const appendOffset = html[startTagEndOffset - 2] === '/' ? 2 : 1
+
+        s.appendRight(startTagEndOffset - appendOffset, ` nonce="${nonce}"`)
+      }
+    })
+
+    return s.toString()
   }
 }
 
@@ -1180,6 +1266,42 @@ export function resolveHtmlTransforms(
   return [preHooks, normalHooks, postHooks]
 }
 
+// https://developer.mozilla.org/en-US/docs/Web/HTML/Element/head#see_also
+const elementsAllowedInHead = new Set([
+  'title',
+  'base',
+  'link',
+  'style',
+  'meta',
+  'script',
+  'noscript',
+  'template',
+])
+
+function headTagInsertCheck(
+  tags: HtmlTagDescriptor[],
+  ctx: IndexHtmlTransformContext,
+) {
+  if (!tags.length) return
+  const { logger } = ctx.server?.config || {}
+  const disallowedTags = tags.filter(
+    (tagDescriptor) => !elementsAllowedInHead.has(tagDescriptor.tag),
+  )
+
+  if (disallowedTags.length) {
+    const dedupedTags = unique(
+      disallowedTags.map((tagDescriptor) => `<${tagDescriptor.tag}>`),
+    )
+    logger?.warn(
+      colors.yellow(
+        colors.bold(
+          `[${dedupedTags.join(',')}] can not be used inside the <head> Element, please check the 'injectTo' value`,
+        ),
+      ),
+    )
+  }
+}
+
 export async function applyHtmlTransforms(
   html: string,
   hooks: IndexHtmlTransformHook[],
@@ -1201,27 +1323,31 @@ export async function applyHtmlTransforms(
         tags = res.tags
       }
 
-      const headTags: HtmlTagDescriptor[] = []
-      const headPrependTags: HtmlTagDescriptor[] = []
-      const bodyTags: HtmlTagDescriptor[] = []
-      const bodyPrependTags: HtmlTagDescriptor[] = []
+      let headTags: HtmlTagDescriptor[] | undefined
+      let headPrependTags: HtmlTagDescriptor[] | undefined
+      let bodyTags: HtmlTagDescriptor[] | undefined
+      let bodyPrependTags: HtmlTagDescriptor[] | undefined
 
       for (const tag of tags) {
-        if (tag.injectTo === 'body') {
-          bodyTags.push(tag)
-        } else if (tag.injectTo === 'body-prepend') {
-          bodyPrependTags.push(tag)
-        } else if (tag.injectTo === 'head') {
-          headTags.push(tag)
-        } else {
-          headPrependTags.push(tag)
+        switch (tag.injectTo) {
+          case 'body':
+            ;(bodyTags ??= []).push(tag)
+            break
+          case 'body-prepend':
+            ;(bodyPrependTags ??= []).push(tag)
+            break
+          case 'head':
+            ;(headTags ??= []).push(tag)
+            break
+          default:
+            ;(headPrependTags ??= []).push(tag)
         }
       }
-
-      html = injectToHead(html, headPrependTags, true)
-      html = injectToHead(html, headTags)
-      html = injectToBody(html, bodyPrependTags, true)
-      html = injectToBody(html, bodyTags)
+      headTagInsertCheck([...(headTags || []), ...(headPrependTags || [])], ctx)
+      if (headPrependTags) html = injectToHead(html, headPrependTags, true)
+      if (headTags) html = injectToHead(html, headTags)
+      if (bodyPrependTags) html = injectToBody(html, bodyPrependTags, true)
+      if (bodyTags) html = injectToBody(html, bodyTags)
     }
   }
 

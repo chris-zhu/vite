@@ -163,6 +163,13 @@ Enabling this setting causes vite to determine file identity by the original fil
 - **Related:** [esbuild#preserve-symlinks](https://esbuild.github.io/api/#preserve-symlinks), [webpack#resolve.symlinks
   ](https://webpack.js.org/configuration/resolve/#resolvesymlinks)
 
+## html.cspNonce
+
+- **Type:** `string`
+- **Related:** [Content Security Policy (CSP)](/guide/features#content-security-policy-csp)
+
+A nonce value placeholder that will be used when generating script / style tags. Setting this value will also generate a meta tag with nonce value.
+
 ## css.modules
 
 - **Type:**
@@ -222,17 +229,12 @@ Specify options to pass to CSS pre-processors. The file extensions are used as k
 - `less` - [Options](https://lesscss.org/usage/#less-options).
 - `styl`/`stylus` - Only [`define`](https://stylus-lang.com/docs/js.html#define-name-node) is supported, which can be passed as an object.
 
-All preprocessor options also support the `additionalData` option, which can be used to inject extra code for each style content. Note that if you include actual styles and not just variables, those styles will be duplicated in the final bundle.
-
-Example:
+**Example:**
 
 ```js
 export default defineConfig({
   css: {
     preprocessorOptions: {
-      scss: {
-        additionalData: `$injectedColor: orange;`,
-      },
       less: {
         math: 'parens-division',
       },
@@ -245,6 +247,34 @@ export default defineConfig({
   },
 })
 ```
+
+### css.preprocessorOptions[extension].additionalData
+
+- **Type:** `string | ((source: string, filename: string) => (string | { content: string; map?: SourceMap }))`
+
+This option can be used to inject extra code for each style content. Note that if you include actual styles and not just variables, those styles will be duplicated in the final bundle.
+
+**Example:**
+
+```js
+export default defineConfig({
+  css: {
+    preprocessorOptions: {
+      scss: {
+        additionalData: `$injectedColor: orange;`,
+      },
+    },
+  },
+})
+```
+
+## css.preprocessorMaxWorkers
+
+- **Experimental:** [Give Feedback](https://github.com/vitejs/vite/discussions/15835)
+- **Type:** `number | true`
+- **Default:** `0` (does not create any workers and run in the main thread)
+
+If this option is set, CSS preprocessors will run in workers when possible. `true` means the number of CPUs minus 1.
 
 ## css.devSourcemap
 
@@ -261,6 +291,10 @@ Whether to enable sourcemaps during dev.
 - **Default:** `'postcss'`
 
 Selects the engine used for CSS processing. Check out [Lightning CSS](../guide/features.md#lightning-css) for more information.
+
+::: info Duplicate `@import`s
+Note that postcss (postcss-import) has a different behavior with duplicated `@import` from browsers. See [postcss/postcss-import#462](https://github.com/postcss/postcss-import/issues/462).
+:::
 
 ## css.lightningcss
 
@@ -385,7 +419,7 @@ Adjust console output verbosity. Default is `'info'`.
 
 Use a custom logger to log messages. You can use Vite's `createLogger` API to get the default logger and customize it to, for example, change the message or filter out certain warnings.
 
-```js
+```ts twoslash
 import { createLogger, defineConfig } from 'vite'
 
 const logger = createLogger()

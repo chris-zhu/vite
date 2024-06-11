@@ -18,10 +18,10 @@ The first case is when `localhost` is used. Node.js under v17 reorders the resul
 
 You can set [`dns.setDefaultResultOrder('verbatim')`](https://nodejs.org/api/dns.html#dns_dns_setdefaultresultorder_order) to disable the reordering behavior. Vite will then print the address as `localhost`.
 
-```js
+```js twoslash
 // vite.config.js
 import { defineConfig } from 'vite'
-import dns from 'dns'
+import dns from 'node:dns'
 
 dns.setDefaultResultOrder('verbatim')
 
@@ -90,7 +90,7 @@ Configure custom proxy rules for the dev server. Expects an object of `{ key: op
 
 Note that if you are using non-relative [`base`](/config/shared-options.md#base), you must prefix each key with that `base`.
 
-Extends [`http-proxy`](https://github.com/http-party/node-http-proxy#options). Additional options are [here](https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/middlewares/proxy.ts#L12).
+Extends [`http-proxy`](https://github.com/http-party/node-http-proxy#options). Additional options are [here](https://github.com/vitejs/vite/blob/main/packages/vite/src/node/server/middlewares/proxy.ts#L13). Note that [unlike http-proxy](https://github.com/http-party/node-http-proxy/issues/1669), the `changeOrigin` option will change both host and origin headers to match the target.
 
 In some cases, you might also want to configure the underlying dev server (e.g. to add custom middlewares to the internal [connect](https://github.com/senchalabs/connect) app). In order to do that, you need to write your own [plugin](/guide/using-plugins.html) and use [configureServer](/guide/api-plugin.html#configureserver) function.
 
@@ -152,6 +152,8 @@ Disable or configure HMR connection (in cases where the HMR websocket must use a
 
 Set `server.hmr.overlay` to `false` to disable the server error overlay.
 
+`protocol` sets the WebSocket protocol used for the HMR connection: `ws` (WebSocket) or `wss` (WebSocket Secure).
+
 `clientPort` is an advanced option that overrides the port only on the client side, allowing you to serve the websocket on a different port than the client code looks for it on.
 
 When `server.hmr.server` is defined, Vite will process the HMR connection requests through the provided server. If not in middleware mode, Vite will attempt to process HMR connection requests through the existing server. This can be helpful when using self-signed certificates or when you want to expose Vite over a network on a single port.
@@ -202,7 +204,7 @@ export default defineConfig({
 
 File system watcher options to pass on to [chokidar](https://github.com/paulmillr/chokidar#api).
 
-The Vite server watcher watches the `root` and skips the `.git/` and `node_modules/` directories by default. When updating a watched file, Vite will apply HMR and update the page only if needed.
+The Vite server watcher watches the `root` and skips the `.git/`, `node_modules/`, and Vite's `cacheDir` and `build.outDir` directories by default. When updating a watched file, Vite will apply HMR and update the page only if needed.
 
 If set to `null`, no files will be watched. `server.watcher` will provide a compatible event emitter, but calling `add` or `unwatch` will have no effect.
 
@@ -236,7 +238,7 @@ Create Vite server in middleware mode.
 
 - **Example:**
 
-```js
+```js twoslash
 import express from 'express'
 import { createServer as createViteServer } from 'vite'
 
@@ -356,9 +358,9 @@ export default defineConfig({
     // in their paths to the ignore list.
     sourcemapIgnoreList(sourcePath, sourcemapPath) {
       return sourcePath.includes('node_modules')
-    }
-  }
-};
+    },
+  },
+})
 ```
 
 ::: tip Note

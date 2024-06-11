@@ -18,24 +18,24 @@ import type { Plugin } from '../plugin'
 import type { ResolvedConfig } from '../config'
 import { checkPublicFile } from '../publicDir'
 import {
-  cleanUrl,
+  encodeURIPath,
   getHash,
   injectQuery,
   joinUrlSegments,
   normalizePath,
+  rawRE,
   removeLeadingSlash,
-  withTrailingSlash,
+  removeUrlQuery,
+  urlRE,
 } from '../utils'
-import { FS_PREFIX } from '../constants'
+import { DEFAULT_ASSETS_INLINE_LIMIT, FS_PREFIX } from '../constants'
 import type { ModuleGraph } from '../server/moduleGraph'
+import { cleanUrl, withTrailingSlash } from '../../shared/utils'
 
 // referenceId is base64url but replaces - with $
 export const assetUrlRE = /__VITE_ASSET__([\w$]+)__(?:\$_(.*?)__)?/g
 
-const rawRE = /(?:\?|&)raw(?:&|$)/
-export const urlRE = /(\?|&)url(?:&|$)/
 const jsSourceMapRE = /\.[cm]?js\.map$/
-const unnededFinalQueryCharRE = /[?&]$/
 
 const assetCache = new WeakMap<ResolvedConfig, Map<string, string>>()
 
@@ -57,10 +57,6 @@ export function registerCustomMime(): void {
   mrmime.mimes['ico'] = 'image/x-icon'
   // https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Containers#flac
   mrmime.mimes['flac'] = 'audio/flac'
-  // mrmime and mime-db is not released yet: https://github.com/jshttp/mime-db/commit/c9242a9b7d4bb25d7a0c9244adec74aeef08d8a1
-  mrmime.mimes['aac'] = 'audio/aac'
-  // https://wiki.xiph.org/MIME_Types_and_File_Extensions#.opus_-_audio/ogg
-  mrmime.mimes['opus'] = 'audio/ogg'
   // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types/Common_types
   mrmime.mimes['eot'] = 'application/vnd.ms-fontobject'
 }
@@ -105,7 +101,7 @@ export function renderAssetUrlInJS(
     )
     const replacementString =
       typeof replacement === 'string'
-        ? JSON.stringify(replacement).slice(1, -1)
+        ? JSON.stringify(encodeURIPath(replacement)).slice(1, -1)
         : `"+${replacement.runtime}+"`
     s.update(match.index, match.index + full.length, replacementString)
   }
@@ -128,7 +124,7 @@ export function renderAssetUrlInJS(
     )
     const replacementString =
       typeof replacement === 'string'
-        ? JSON.stringify(replacement).slice(1, -1)
+        ? JSON.stringify(encodeURIPath(replacement)).slice(1, -1)
         : `"+${replacement.runtime}+"`
     s.update(match.index, match.index + full.length, replacementString)
   }
@@ -195,11 +191,11 @@ export function assetPlugin(config: ResolvedConfig): Plugin {
         )}`
       }
 
-      if (!config.assetsInclude(cleanUrl(id)) && !urlRE.test(id)) {
+      if (!urlRE.test(id) && !config.assetsInclude(cleanUrl(id))) {
         return
       }
 
-      id = id.replace(urlRE, '$1').replace(unnededFinalQueryCharRE, '')
+      id = removeUrlQuery(id)
       let url = await fileToUrl(id, config, this)
 
       // Inherit HMR timestamp if this asset was invalidated
@@ -210,7 +206,15 @@ export function assetPlugin(config: ResolvedConfig): Plugin {
         }
       }
 
-      return `export default ${JSON.stringify(url)}`
+      return {
+        code: `export default ${JSON.stringify(encodeURIPath(url))}`,
+        // Force rollup to keep this module from being shared between other entry points if it's an entrypoint.
+        // If the resulting chunk is empty, it will be removed in generateBundle.
+        moduleSideEffects:
+          config.command === 'build' && this.getModuleInfo(id)?.isEntry
+            ? 'no-treeshake'
+            : false,
+      }
     },
 
     renderChunk(code, chunk, opts) {
@@ -229,6 +233,19 @@ export function assetPlugin(config: ResolvedConfig): Plugin {
     },
 
     generateBundle(_, bundle) {
+      // Remove empty entry point file
+      for (const file in bundle) {
+        const chunk = bundle[file]
+        if (
+          chunk.type === 'chunk' &&
+          chunk.isEntry &&
+          chunk.moduleIds.length === 1 &&
+          config.assetsInclude(chunk.moduleIds[0])
+        ) {
+          delete bundle[file]
+        }
+      }
+
       // do not emit assets for SSR build
       if (
         config.command === 'build' &&
@@ -329,7 +346,7 @@ async function fileToBuiltUrl(
   config: ResolvedConfig,
   pluginContext: PluginContext,
   skipPublicCheck = false,
-  shouldInline?: boolean,
+  forceInline?: boolean,
 ): Promise<string> {
   if (!skipPublicCheck && checkPublicFile(id, config)) {
     return publicFileToBuiltUrl(id, config)
@@ -344,18 +361,8 @@ async function fileToBuiltUrl(
   const file = cleanUrl(id)
   const content = await fsp.readFile(file)
 
-  if (shouldInline == null) {
-    shouldInline =
-      !!config.build.lib ||
-      // Don't inline SVG with fragments, as they are meant to be reused
-      (!(file.endsWith('.svg') && id.includes('#')) &&
-        !file.endsWith('.html') &&
-        content.length < Number(config.build.assetsInlineLimit) &&
-        !isGitLfsPlaceholder(content))
-  }
-
   let url: string
-  if (shouldInline) {
+  if (shouldInline(config, file, id, content, pluginContext, forceInline)) {
     if (config.build.lib && isGitLfsPlaceholder(content)) {
       config.logger.warn(
         colors.yellow(`Inlined file ${id} was not downloaded via Git LFS`),
@@ -396,7 +403,7 @@ export async function urlToBuiltUrl(
   importer: string,
   config: ResolvedConfig,
   pluginContext: PluginContext,
-  shouldInline?: boolean,
+  forceInline?: boolean,
 ): Promise<string> {
   if (checkPublicFile(url, config)) {
     return publicFileToBuiltUrl(url, config)
@@ -411,8 +418,33 @@ export async function urlToBuiltUrl(
     pluginContext,
     // skip public check since we just did it above
     true,
-    shouldInline,
+    forceInline,
   )
+}
+
+const shouldInline = (
+  config: ResolvedConfig,
+  file: string,
+  id: string,
+  content: Buffer,
+  pluginContext: PluginContext,
+  forceInline: boolean | undefined,
+): boolean => {
+  if (config.build.lib) return true
+  if (pluginContext.getModuleInfo(id)?.isEntry) return false
+  if (forceInline !== undefined) return forceInline
+  let limit: number
+  if (typeof config.build.assetsInlineLimit === 'function') {
+    const userShouldInline = config.build.assetsInlineLimit(file, content)
+    if (userShouldInline != null) return userShouldInline
+    limit = DEFAULT_ASSETS_INLINE_LIMIT
+  } else {
+    limit = Number(config.build.assetsInlineLimit)
+  }
+  if (file.endsWith('.html')) return false
+  // Don't inline SVG with fragments, as they are meant to be reused
+  if (file.endsWith('.svg') && id.includes('#')) return false
+  return content.length < limit && !isGitLfsPlaceholder(content)
 }
 
 const nestedQuotesRE = /"[^"']*'[^"]*"|'[^'"]*"[^']*'/

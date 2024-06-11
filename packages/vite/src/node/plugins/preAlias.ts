@@ -9,14 +9,13 @@ import type { Plugin } from '../plugin'
 import { createIsConfiguredAsSsrExternal } from '../ssr/ssrExternal'
 import {
   bareImportRE,
-  cleanUrl,
   isInNodeModules,
   isOptimizable,
   moduleListContains,
-  withTrailingSlash,
 } from '../utils'
 import { getFsUtils } from '../fsUtils'
 import { getDepsOptimizer } from '../optimizer'
+import { cleanUrl, withTrailingSlash } from '../../shared/utils'
 import { tryOptimizedResolve } from './resolve'
 
 /**
@@ -31,7 +30,7 @@ export function preAliasPlugin(config: ResolvedConfig): Plugin {
     name: 'vite:pre-alias',
     async resolveId(id, importer, options) {
       const ssr = options?.ssr === true
-      const depsOptimizer = getDepsOptimizer(config, ssr)
+      const depsOptimizer = !isBuild && getDepsOptimizer(config, ssr)
       if (
         importer &&
         depsOptimizer &&
@@ -128,4 +127,12 @@ function getAliasPatterns(
     return entries.map((entry) => entry.find)
   }
   return Object.entries(entries).map(([find]) => find)
+}
+
+export function getAliasPatternMatcher(
+  entries: (AliasOptions | undefined) & Alias[],
+): (importee: string) => boolean {
+  const patterns = getAliasPatterns(entries)
+  return (importee: string) =>
+    patterns.some((pattern) => matches(pattern, importee))
 }

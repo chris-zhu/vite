@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { execSync } from 'node:child_process'
 import type * as net from 'node:net'
 import { get as httpGet } from 'node:http'
 import { get as httpsGet } from 'node:https'
@@ -15,7 +16,6 @@ import launchEditorMiddleware from 'launch-editor-middleware'
 import type { SourceMap } from 'rollup'
 import picomatch from 'picomatch'
 import type { Matcher } from 'picomatch'
-import type { InvalidatePayload } from 'types/customEvent'
 import type { CommonServerOptions } from '../http'
 import {
   httpServerStart,
@@ -32,26 +32,33 @@ import {
   isParentDirectory,
   mergeConfig,
   normalizePath,
+  promiseWithResolvers,
   resolveHostname,
   resolveServerUrls,
+  setupSIGTERMListener,
+  teardownSIGTERMListener,
 } from '../utils'
 import { getFsUtils } from '../fsUtils'
 import { ssrLoadModule } from '../ssr/ssrModuleLoader'
 import { ssrFixStacktrace, ssrRewriteStacktrace } from '../ssr/ssrStacktrace'
 import { ssrTransform } from '../ssr/ssrTransform'
 import { ERR_OUTDATED_OPTIMIZED_DEP } from '../plugins/optimizedDeps'
-import {
-  getDepsOptimizer,
-  initDepsOptimizer,
-  initDevSsrDepsOptimizer,
-} from '../optimizer'
+import { getDepsOptimizer, initDepsOptimizer } from '../optimizer'
 import { bindCLIShortcuts } from '../shortcuts'
 import type { BindCLIShortcutsOptions } from '../shortcuts'
 import { CLIENT_DIR, DEFAULT_DEV_PORT } from '../constants'
 import type { Logger } from '../logger'
 import { printServerUrls } from '../logger'
-import { createNoopWatcher, resolveChokidarOptions } from '../watch'
+import {
+  createNoopWatcher,
+  getResolvedOutDirs,
+  resolveChokidarOptions,
+  resolveEmptyOutDir,
+} from '../watch'
 import { initPublicFiles } from '../publicDir'
+import { getEnvFilesForMode } from '../env'
+import type { FetchResult } from '../../runtime/types'
+import { ssrFetchModule } from '../ssr/ssrFetchModule'
 import type { PluginContainer } from './pluginContainer'
 import { ERR_CLOSED_SERVER, createPluginContainer } from './pluginContainer'
 import type { WebSocketServer } from './ws'
@@ -59,7 +66,10 @@ import { createWebSocketServer } from './ws'
 import { baseMiddleware } from './middlewares/base'
 import { proxyMiddleware } from './middlewares/proxy'
 import { htmlFallbackMiddleware } from './middlewares/htmlFallback'
-import { transformMiddleware } from './middlewares/transform'
+import {
+  cachedTransformMiddleware,
+  transformMiddleware,
+} from './middlewares/transform'
 import {
   createDevHtmlTransformFn,
   indexHtmlMiddleware,
@@ -74,10 +84,11 @@ import type { ModuleNode } from './moduleGraph'
 import { ModuleGraph } from './moduleGraph'
 import { notFoundMiddleware } from './middlewares/notFound'
 import { errorMiddleware, prepareError } from './middlewares/error'
-import type { HmrOptions } from './hmr'
+import type { HMRBroadcaster, HmrOptions } from './hmr'
 import {
+  createHMRBroadcaster,
+  createServerHMRChannel,
   getShortName,
-  handleFileAddUnlink,
   handleHMRUpdate,
   updateModules,
 } from './hmr'
@@ -92,6 +103,11 @@ export interface ServerOptions extends CommonServerOptions {
    * Configure HMR-specific options (port, host, path & protocol)
    */
   hmr?: HmrOptions | boolean
+  /**
+   * Do not start the websocket connection.
+   * @experimental
+   */
+  ws?: false
   /**
    * Warm-up files to transform and cache the results in advance. This improves the
    * initial page load during server starts and prevents transform waterfalls.
@@ -153,9 +169,10 @@ export interface ServerOptions extends CommonServerOptions {
     | ((sourcePath: string, sourcemapPath: string) => boolean)
 }
 
-export interface ResolvedServerOptions extends ServerOptions {
+export interface ResolvedServerOptions
+  extends Omit<ServerOptions, 'fs' | 'middlewareMode' | 'sourcemapIgnoreList'> {
   fs: Required<FileSystemServeOptions>
-  middlewareMode: boolean
+  middlewareMode: NonNullable<ServerOptions['middlewareMode']>
   sourcemapIgnoreList: Exclude<
     ServerOptions['sourcemapIgnoreList'],
     false | undefined
@@ -191,10 +208,10 @@ export interface FileSystemServeOptions {
   deny?: string[]
 
   /**
-   * Enable caching of fs calls.
+   * Enable caching of fs calls. It is enabled by default if no custom watch ignored patterns are provided.
    *
    * @experimental
-   * @default false
+   * @default undefined
    */
   cachedChecks?: boolean
 }
@@ -234,6 +251,14 @@ export interface ViteDevServer {
    * web socket server with `send(payload)` method
    */
   ws: WebSocketServer
+  /**
+   * HMR broadcaster that can be used to send custom HMR messages to the client
+   *
+   * Always sends a message to at least a WebSocket client. Any third party can
+   * add a channel to the broadcaster to process messages
+   * @deprecated will be replaced with the environment api in v6.
+   */
+  hot: HMRBroadcaster
   /**
    * Rollup plugin container that can run plugin hooks on a given file
    */
@@ -287,6 +312,11 @@ export interface ViteDevServer {
     opts?: { fixStacktrace?: boolean },
   ): Promise<Record<string, any>>
   /**
+   * Fetch information about the module for Vite SSR runtime.
+   * @experimental
+   */
+  ssrFetchModule(id: string, importer?: string): Promise<FetchResult>
+  /**
    * Returns a fixed version of the given stack
    */
   ssrRewriteStacktrace(stack: string): string
@@ -326,6 +356,22 @@ export interface ViteDevServer {
    * Open browser
    */
   openBrowser(): void
+  /**
+   * Calling `await server.waitForRequestsIdle(id)` will wait until all static imports
+   * are processed. If called from a load or transform plugin hook, the id needs to be
+   * passed as a parameter to avoid deadlocks. Calling this function after the first
+   * static imports section of the module graph has been processed will resolve immediately.
+   * @experimental
+   */
+  waitForRequestsIdle: (ignoredId?: string) => Promise<void>
+  /**
+   * @internal
+   */
+  _registerRequestProcessing: (id: string, done: () => Promise<unknown>) => void
+  /**
+   * @internal
+   */
+  _onCrawlEnd(cb: () => void): void
   /**
    * @internal
    */
@@ -379,12 +425,12 @@ export interface ResolvedServerUrls {
 export function createServer(
   inlineConfig: InlineConfig = {},
 ): Promise<ViteDevServer> {
-  return _createServer(inlineConfig, { ws: true })
+  return _createServer(inlineConfig, { hotListen: true })
 }
 
 export async function _createServer(
   inlineConfig: InlineConfig = {},
-  options: { ws: boolean },
+  options: { hotListen: boolean },
 ): Promise<ViteDevServer> {
   const config = await resolveConfig(inlineConfig, 'serve')
 
@@ -394,16 +440,41 @@ export async function _createServer(
   const httpsOptions = await resolveHttpsConfig(config.server.https)
   const { middlewareMode } = serverConfig
 
-  const resolvedWatchOptions = resolveChokidarOptions(config, {
-    disableGlobbing: true,
-    ...serverConfig.watch,
-  })
+  const resolvedOutDirs = getResolvedOutDirs(
+    config.root,
+    config.build.outDir,
+    config.build.rollupOptions?.output,
+  )
+  const emptyOutDir = resolveEmptyOutDir(
+    config.build.emptyOutDir,
+    config.root,
+    resolvedOutDirs,
+  )
+  const resolvedWatchOptions = resolveChokidarOptions(
+    config,
+    {
+      disableGlobbing: true,
+      ...serverConfig.watch,
+    },
+    resolvedOutDirs,
+    emptyOutDir,
+  )
 
   const middlewares = connect() as Connect.Server
   const httpServer = middlewareMode
     ? null
     : await resolveHttpServer(serverConfig, middlewares, httpsOptions)
+
   const ws = createWebSocketServer(httpServer, config, httpsOptions)
+  const hot = createHMRBroadcaster()
+    .addChannel(ws)
+    .addChannel(createServerHMRChannel())
+  if (typeof config.server.hmr === 'object' && config.server.hmr.channels) {
+    config.server.hmr.channels.forEach((channel) => hot.addChannel(channel))
+  }
+
+  const publicFiles = await initPublicFilesPromise
+  const { publicDir } = config
 
   if (httpServer) {
     setClientErrorHandler(httpServer, config.logger)
@@ -414,7 +485,14 @@ export async function _createServer(
   const watcher = watchEnabled
     ? (chokidar.watch(
         // config file dependencies and env file might be outside of root
-        [...new Set([root, ...config.configFileDependencies, config.envDir])],
+        [
+          root,
+          ...config.configFileDependencies,
+          ...getEnvFilesForMode(config.mode, config.envDir),
+          // Watch the public directory explicitly because it might be outside
+          // of the root directory.
+          ...(publicDir && publicFiles ? [publicDir] : []),
+        ],
         resolvedWatchOptions,
       ) as FSWatcher)
     : createNoopWatcher(resolvedWatchOptions)
@@ -426,9 +504,21 @@ export async function _createServer(
   const container = await createPluginContainer(config, moduleGraph, watcher)
   const closeHttpServer = createServerCloseFn(httpServer)
 
-  let exitProcess: () => void
-
   const devHtmlTransformFn = createDevHtmlTransformFn(config)
+
+  const onCrawlEndCallbacks: (() => void)[] = []
+  const crawlEndFinder = setupOnCrawlEnd(() => {
+    onCrawlEndCallbacks.forEach((cb) => cb())
+  })
+  function waitForRequestsIdle(ignoredId?: string): Promise<void> {
+    return crawlEndFinder.waitForRequestsIdle(ignoredId)
+  }
+  function _registerRequestProcessing(id: string, done: () => Promise<any>) {
+    crawlEndFinder.registerRequestProcessing(id, done)
+  }
+  function _onCrawlEnd(cb: () => void) {
+    onCrawlEndCallbacks.push(cb)
+  }
 
   let server: ViteDevServer = {
     config,
@@ -437,6 +527,7 @@ export async function _createServer(
     watcher,
     pluginContainer: container,
     ws,
+    hot,
     moduleGraph,
     resolvedUrls: null, // will be set on listen
     ssrTransform(
@@ -451,7 +542,9 @@ export async function _createServer(
       return transformRequest(url, server, options)
     },
     async warmupRequest(url, options) {
-      await transformRequest(url, server, options).catch((e) => {
+      try {
+        await transformRequest(url, server, options)
+      } catch (e) {
         if (
           e?.code === ERR_OUTDATED_OPTIMIZED_DEP ||
           e?.code === ERR_CLOSED_SERVER
@@ -464,22 +557,16 @@ export async function _createServer(
           error: e,
           timestamp: true,
         })
-      })
+      }
     },
     transformIndexHtml(url, html, originalUrl) {
       return devHtmlTransformFn(server, url, html, originalUrl)
     },
     async ssrLoadModule(url, opts?: { fixStacktrace?: boolean }) {
-      if (isDepsOptimizerEnabled(config, true)) {
-        await initDevSsrDepsOptimizer(config, server)
-      }
-      return ssrLoadModule(
-        url,
-        server,
-        undefined,
-        undefined,
-        opts?.fixStacktrace,
-      )
+      return ssrLoadModule(url, server, undefined, opts?.fixStacktrace)
+    },
+    async ssrFetchModule(url: string, importer?: string) {
+      return ssrFetchModule(server, url, importer)
     },
     ssrFixStacktrace(e) {
       ssrFixStacktrace(e, moduleGraph)
@@ -551,15 +638,13 @@ export async function _createServer(
     },
     async close() {
       if (!middlewareMode) {
-        process.off('SIGTERM', exitProcess)
-        if (process.env.CI !== 'true') {
-          process.stdin.off('end', exitProcess)
-        }
+        teardownSIGTERMListener(closeServerAndExit)
       }
       await Promise.allSettled([
         watcher.close(),
-        ws.close(),
+        hot.close(),
         container.close(),
+        crawlEndFinder?.cancel(),
         getDepsOptimizer(server.config)?.close(),
         getDepsOptimizer(server.config, true)?.close(),
         closeHttpServer(),
@@ -608,6 +693,10 @@ export async function _createServer(
       return server._restartPromise
     },
 
+    waitForRequestsIdle,
+    _registerRequestProcessing,
+    _onCrawlEnd,
+
     _setInternalServer(_server: ViteDevServer) {
       // Rebind internal the server variable so functions reference the user
       // server instance after a restart
@@ -617,32 +706,54 @@ export async function _createServer(
     _importGlobMap: new Map(),
     _forceOptimizeOnRestart: false,
     _pendingRequests: new Map(),
-    _fsDenyGlob: picomatch(config.server.fs.deny, { matchBase: true }),
+    _fsDenyGlob: picomatch(
+      // matchBase: true does not work as it's documented
+      // https://github.com/micromatch/picomatch/issues/89
+      // convert patterns without `/` on our side for now
+      config.server.fs.deny.map((pattern) =>
+        pattern.includes('/') ? pattern : `**/${pattern}`,
+      ),
+      {
+        matchBase: false,
+        nocase: true,
+        dot: true,
+      },
+    ),
     _shortcutsOptions: undefined,
   }
 
-  if (!middlewareMode) {
-    exitProcess = async () => {
-      try {
-        await server.close()
-      } finally {
-        process.exit()
-      }
-    }
-    process.once('SIGTERM', exitProcess)
-    if (process.env.CI !== 'true') {
-      process.stdin.on('end', exitProcess)
+  // maintain consistency with the server instance after restarting.
+  const reflexServer = new Proxy(server, {
+    get: (_, property: keyof ViteDevServer) => {
+      return server[property]
+    },
+    set: (_, property: keyof ViteDevServer, value: never) => {
+      server[property] = value
+      return true
+    },
+  })
+
+  const closeServerAndExit = async () => {
+    try {
+      await server.close()
+    } finally {
+      process.exit()
     }
   }
 
-  const publicFiles = await initPublicFilesPromise
+  if (!middlewareMode) {
+    setupSIGTERMListener(closeServerAndExit)
+  }
 
-  const onHMRUpdate = async (file: string, configOnly: boolean) => {
+  const onHMRUpdate = async (
+    type: 'create' | 'delete' | 'update',
+    file: string,
+  ) => {
     if (serverConfig.hmr !== false) {
       try {
-        await handleHMRUpdate(file, server, configOnly)
+        await handleHMRUpdate(type, file, server)
       } catch (err) {
-        ws.send({
+        hot.send({
           type: 'error',
           err: prepareError(err),
         })
@@ -650,21 +761,27 @@ export async function _createServer(
     }
   }
 
-  const normalizedPublicDir = normalizePath(config.publicDir)
-
   const onFileAddUnlink = async (file: string, isUnlink: boolean) => {
     file = normalizePath(file)
     await container.watchChange(file, { event: isUnlink ? 'delete' : 'create' })
 
-    if (config.publicDir && publicFiles) {
-      if (file.startsWith(normalizedPublicDir)) {
-        publicFiles[isUnlink ? 'delete' : 'add'](
-          file.slice(normalizedPublicDir.length),
-        )
+    if (publicDir && publicFiles) {
+      if (file.startsWith(publicDir)) {
+        const path = file.slice(publicDir.length)
+        publicFiles[isUnlink ? 'delete' : 'add'](path)
+        if (!isUnlink) {
+          const moduleWithSamePath = await moduleGraph.getModuleByUrl(path)
+          const etag = moduleWithSamePath?.transformResult?.etag
+          if (etag) {
+            // The public file should win on the next request over a module with the
+            // same path. Prevent the transform etag fast path from serving the module
+            moduleGraph.etagToModuleMap.delete(etag)
+          }
+        }
       }
     }
-    await handleFileAddUnlink(file, server, isUnlink)
-    await onHMRUpdate(file, true)
+    if (isUnlink) moduleGraph.onFileDelete(file)
+    await onHMRUpdate(isUnlink ? 'delete' : 'create', file)
   }
 
   watcher.on('change', async (file) => {
@@ -672,7 +789,7 @@ export async function _createServer(
     await container.watchChange(file, { event: 'update' })
     // invalidate module graph cache on file change
     moduleGraph.onFileChange(file)
-    await onHMRUpdate(file, false)
+    await onHMRUpdate('update', file)
   })
 
   getFsUtils(config).initWatcher?.(watcher)
@@ -684,9 +801,15 @@ export async function _createServer(
     onFileAddUnlink(file, true)
   })
 
-  ws.on('vite:invalidate', async ({ path, message }: InvalidatePayload) => {
+  hot.on('vite:invalidate', async ({ path, message }) => {
     const mod = moduleGraph.urlToModuleMap.get(path)
-    if (mod && mod.isSelfAccepting && mod.lastHMRTimestamp > 0) {
+    if (
+      mod &&
+      mod.isSelfAccepting &&
+      mod.lastHMRTimestamp > 0 &&
+      !mod.lastHMRInvalidationReceived
+    ) {
+      mod.lastHMRInvalidationReceived = true
       config.logger.info(
         colors.yellow(`hmr invalidate `) +
           colors.dim(path) +
@@ -714,7 +837,7 @@ export async function _createServer(
   // apply server configuration hooks from plugins
   const postHooks: ((() => void) | void)[] = []
   for (const hook of config.getSortedPluginHooks('configureServer')) {
-    postHooks.push(await hook(server))
+    postHooks.push(await hook(reflexServer))
   }
 
   // Internal middlewares ------------------------------------------------------
@@ -730,19 +853,19 @@ export async function _createServer(
     middlewares.use(corsMiddleware(typeof cors === 'boolean' ? {} : cors))
   }
 
+  middlewares.use(cachedTransformMiddleware(server))
+
   // proxy
   const { proxy } = serverConfig
   if (proxy) {
     const middlewareServer =
-      (isObject(serverConfig.middlewareMode)
-        ? serverConfig.middlewareMode.server
-        : null) || httpServer
+      (isObject(middlewareMode) ? middlewareMode.server : null) || httpServer
     middlewares.use(proxyMiddleware(middlewareServer, proxy, config))
   }
 
   // base
   if (config.base !== '/') {
-    middlewares.use(baseMiddleware(config.rawBase, middlewareMode))
+    middlewares.use(baseMiddleware(config.rawBase, !!middlewareMode))
   }
 
   // open in editor support
@@ -761,7 +884,7 @@ export async function _createServer(
   // serve static files under /public
   // this applies before the transform middleware so that these files are served
   // as-is without transforms.
-  if (config.publicDir) {
+  if (publicDir) {
     middlewares.use(servePublicMiddleware(server, publicFiles))
   }
 
@@ -797,7 +920,7 @@ export async function _createServer(
   }
 
   // error handler
-  middlewares.use(errorMiddleware(server, middlewareMode))
+  middlewares.use(errorMiddleware(server, !!middlewareMode))
 
   // httpServer.listen can be called multiple times
   // when port when using next port number
@@ -827,7 +950,7 @@ export async function _createServer(
     httpServer.listen = (async (port: number, ...args: any[]) => {
       try {
         // ensure ws server started
-        ws.listen()
+        hot.listen()
         await initServer()
       } catch (e) {
         httpServer.emit('error', e)
@@ -836,8 +959,8 @@ export async function _createServer(
       return listen(port, ...args)
     }) as any
   } else {
-    if (options.ws) {
-      ws.listen()
+    if (options.hotListen) {
+      hot.listen()
     }
     await initServer()
   }
@@ -875,9 +998,11 @@ async function startServer(
   server._currentServerPort = serverPort
 }
 
-function createServerCloseFn(server: HttpServer | null) {
+export function createServerCloseFn(
+  server: HttpServer | null,
+): () => Promise<void> {
   if (!server) {
-    return () => {}
+    return () => Promise.resolve()
   }
 
   let hasListened = false
@@ -927,13 +1052,33 @@ export function resolveServerOptions(
       raw?.sourcemapIgnoreList === false
         ? () => false
         : raw?.sourcemapIgnoreList || isInNodeModules,
-    middlewareMode: !!raw?.middlewareMode,
+    middlewareMode: raw?.middlewareMode || false,
   }
   let allowDirs = server.fs?.allow
   const deny = server.fs?.deny || ['.env', '.env.*', '*.{crt,pem}']
 
   if (!allowDirs) {
     allowDirs = [searchForWorkspaceRoot(root)]
+  }
+
+  if (process.versions.pnp) {
+    try {
+      const enableGlobalCache =
+        execSync('yarn config get enableGlobalCache', { cwd: root })
+          .toString()
+          .trim() === 'true'
+      const yarnCacheDir = execSync(
+        `yarn config get ${enableGlobalCache ? 'globalFolder' : 'cacheFolder'}`,
+        { cwd: root },
+      )
+        .toString()
+        .trim()
+      allowDirs.push(yarnCacheDir)
+    } catch (e) {
+      logger.warn(`Get yarn cache dir error: ${e.message}`, {
+        timestamp: true,
+      })
+    }
   }
 
   allowDirs = allowDirs.map((i) => resolvedAllowDir(root, i))
@@ -948,8 +1093,7 @@ export function resolveServerOptions(
     strict: server.fs?.strict ?? true,
     allow: allowDirs,
     deny,
-    cachedChecks:
-      server.fs?.cachedChecks ?? !!process.env.VITE_SERVER_FS_CACHED_CHECKS,
+    cachedChecks: server.fs?.cachedChecks,
   }
 
   if (server.origin?.endsWith('/')) {
@@ -988,7 +1132,7 @@ async function restartServer(server: ViteDevServer) {
     let newServer = null
     try {
       // delay ws server listen
-      newServer = await _createServer(inlineConfig, { ws: false })
+      newServer = await _createServer(inlineConfig, { hotListen: false })
     } catch (err: any) {
       server.config.logger.error(err.message, {
         timestamp: true,
@@ -1021,7 +1165,7 @@ async function restartServer(server: ViteDevServer) {
   if (!middlewareMode) {
     await server.listen(port, true)
   } else {
-    server.ws.listen()
+    server.hot.listen()
   }
   logger.info('server restarted.', { timestamp: true })
 
@@ -1058,5 +1202,83 @@ export async function restartServerWithUrls(
   ) {
     logger.info('')
     server.printUrls()
+  }
+}
+
+const callCrawlEndIfIdleAfterMs = 50
+
+interface CrawlEndFinder {
+  registerRequestProcessing: (id: string, done: () => Promise<any>) => void
+  waitForRequestsIdle: (ignoredId?: string) => Promise<void>
+  cancel: () => void
+}
+
+function setupOnCrawlEnd(onCrawlEnd: () => void): CrawlEndFinder {
+  const registeredIds = new Set<string>()
+  const seenIds = new Set<string>()
+  const onCrawlEndPromiseWithResolvers = promiseWithResolvers<void>()
+
+  let timeoutHandle: NodeJS.Timeout | undefined
+
+  let cancelled = false
+  function cancel() {
+    cancelled = true
+  }
+
+  let crawlEndCalled = false
+  function callOnCrawlEnd() {
+    if (!cancelled && !crawlEndCalled) {
+      crawlEndCalled = true
+      onCrawlEnd()
+    }
+    onCrawlEndPromiseWithResolvers.resolve()
+  }
+
+  function registerRequestProcessing(
+    id: string,
+    done: () => Promise<any>,
+  ): void {
+    if (!seenIds.has(id)) {
+      seenIds.add(id)
+      registeredIds.add(id)
+      done()
+        .catch(() => {})
+        .finally(() => markIdAsDone(id))
+    }
+  }
+
+  function waitForRequestsIdle(ignoredId?: string): Promise<void> {
+    if (ignoredId) {
+      seenIds.add(ignoredId)
+      markIdAsDone(ignoredId)
+    }
+    return onCrawlEndPromiseWithResolvers.promise
+  }
+
+  function markIdAsDone(id: string): void {
+    if (registeredIds.has(id)) {
+      registeredIds.delete(id)
+      checkIfCrawlEndAfterTimeout()
+    }
+  }
+
+  function checkIfCrawlEndAfterTimeout() {
+    if (cancelled || registeredIds.size > 0) return
+
+    if (timeoutHandle) clearTimeout(timeoutHandle)
+    timeoutHandle = setTimeout(
+      callOnCrawlEndWhenIdle,
+      callCrawlEndIfIdleAfterMs,
+    )
+  }
+  async function callOnCrawlEndWhenIdle() {
+    if (cancelled || registeredIds.size > 0) return
+    callOnCrawlEnd()
+  }
+
+  return {
+    registerRequestProcessing,
+    waitForRequestsIdle,
+    cancel,
   }
 }

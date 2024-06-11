@@ -1,4 +1,6 @@
-import { defineConfig, DefaultTheme } from 'vitepress'
+import type { DefaultTheme } from 'vitepress'
+import { defineConfig } from 'vitepress'
+import { transformerTwoslash } from '@shikijs/vitepress-twoslash'
 import { buildEnd } from './buildEnd.config'
 
 const ogDescription = 'Next Generation Frontend Tooling'
@@ -77,6 +79,7 @@ export default defineConfig({
     ['meta', { property: 'og:image', content: ogImage }],
     ['meta', { property: 'og:url', content: ogUrl }],
     ['meta', { property: 'og:description', content: ogDescription }],
+    ['meta', { property: 'og:site_name', content: 'vitejs' }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:site', content: '@vite_js' }],
     ['meta', { name: 'theme-color', content: '#646cff' }],
@@ -148,6 +151,10 @@ export default defineConfig({
           {
             items: [
               {
+                text: 'Mastodon',
+                link: 'https://elk.zone/m.webtoo.ls/@vite',
+              },
+              {
                 text: 'Twitter',
                 link: 'https://twitter.com/vite_js',
               },
@@ -166,10 +173,6 @@ export default defineConfig({
               {
                 text: 'DEV Community',
                 link: 'https://dev.to/t/vite',
-              },
-              {
-                text: 'Rollup Plugins Compat',
-                link: 'https://vite-rollup-plugins.patak.dev/',
               },
               {
                 text: 'Changelog',
@@ -280,6 +283,10 @@ export default defineConfig({
               link: '/guide/api-javascript',
             },
             {
+              text: 'Vite Runtime API',
+              link: '/guide/api-vite-runtime',
+            },
+            {
               text: 'Config Reference',
               link: '/config/',
             },
@@ -330,6 +337,20 @@ export default defineConfig({
     outline: {
       level: [2, 3],
     },
+  },
+  transformPageData(pageData) {
+    const canonicalUrl = `${ogUrl}/${pageData.relativePath}`
+      .replace(/\/index\.md$/, '/')
+      .replace(/\.md$/, '/')
+    pageData.frontmatter.head ??= []
+    pageData.frontmatter.head.unshift(
+      ['link', { rel: 'canonical', href: canonicalUrl }],
+      ['meta', { property: 'og:title', content: pageData.title }],
+    )
+    return pageData
+  },
+  markdown: {
+    codeTransformers: [transformerTwoslash()],
   },
   buildEnd,
 })

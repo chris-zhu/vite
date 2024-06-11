@@ -4,16 +4,9 @@ import type { RollupError } from 'rollup'
 import { stripLiteral } from 'strip-literal'
 import type { ResolvedConfig } from '../config'
 import type { Plugin } from '../plugin'
-import {
-  cleanUrl,
-  evalValue,
-  injectQuery,
-  parseRequest,
-  slash,
-  transformStableResult,
-} from '../utils'
-import { getDepsOptimizer } from '../optimizer'
+import { evalValue, injectQuery, transformStableResult } from '../utils'
 import type { ResolveFn } from '..'
+import { cleanUrl, slash } from '../../shared/utils'
 import type { WorkerType } from './worker'
 import { WORKER_FILE_ID, workerFileToUrl } from './worker'
 import { fileToUrl } from './asset'
@@ -131,9 +124,7 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
     },
 
     async transform(code, id, options) {
-      const ssr = options?.ssr === true
       if (!options?.ssr && isIncludeWorkerImportMetaUrl(code)) {
-        const query = parseRequest(id)
         let s: MagicString | undefined
         const cleanString = stripLiteral(code)
         const workerImportMetaUrlRE =
@@ -174,21 +165,29 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
                 : slash(path.resolve(path.dirname(id), url))
           }
 
-          let builtUrl: string
-          if (isBuild) {
-            getDepsOptimizer(config, ssr)?.registerWorkersSource(id)
-            builtUrl = await workerFileToUrl(config, file, query)
+          if (
+            isBuild &&
+            config.isWorker &&
+            this.getModuleInfo(cleanUrl(file))?.isEntry
+          ) {
+            s.update(expStart, expEnd, 'self.location.href')
           } else {
-            builtUrl = await fileToUrl(cleanUrl(file), config, this)
-            builtUrl = injectQuery(builtUrl, WORKER_FILE_ID)
-            builtUrl = injectQuery(builtUrl, `type=${workerType}`)
+            let builtUrl: string
+            if (isBuild) {
+              builtUrl = await workerFileToUrl(config, file)
+            } else {
+              builtUrl = await fileToUrl(cleanUrl(file), config, this)
+              builtUrl = injectQuery(
+                builtUrl,
+                `${WORKER_FILE_ID}&type=${workerType}`,
+              )
+            }
+            s.update(
+              expStart,
+              expEnd,
+              `new URL(/* @vite-ignore */ ${JSON.stringify(builtUrl)}, import.meta.url)`,
+            )
           }
-          s.update(
-            expStart,
-            expEnd,
-            // add `'' +` to skip vite:asset-import-meta-url plugin
-            `new URL('' + ${JSON.stringify(builtUrl)}, import.meta.url)`,
-          )
         }
 
         if (s) {
