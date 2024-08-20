@@ -43,7 +43,7 @@ const assetCache = new WeakMap<ResolvedConfig, Map<string, string>>()
 // For the manifest, we need to preserve the original file path and isEntry
 // for CSS assets. We keep a map from referenceId to this information.
 export interface GeneratedAssetMeta {
-  originalName: string
+  originalFileName: string
   isEntry?: boolean
 }
 export const generatedAssets = new WeakMap<
@@ -132,10 +132,6 @@ export function renderAssetUrlInJS(
   return s
 }
 
-// During build, if we don't use a virtual file for public assets, rollup will
-// watch for these ids resulting in watching the root of the file system in Windows,
-const viteBuildPublicIdPrefix = '\0vite:asset:public'
-
 /**
  * Also supports loading plain strings with import text from './foo.txt?raw'
  */
@@ -164,17 +160,11 @@ export function assetPlugin(config: ResolvedConfig): Plugin {
       // will fail to resolve in the main resolver. handle them here.
       const publicFile = checkPublicFile(id, config)
       if (publicFile) {
-        return config.command === 'build'
-          ? `${viteBuildPublicIdPrefix}${id}`
-          : id
+        return id
       }
     },
 
     async load(id) {
-      if (id.startsWith(viteBuildPublicIdPrefix)) {
-        id = id.slice(viteBuildPublicIdPrefix.length)
-      }
-
       if (id[0] === '\0') {
         // Rollup convention, this id should be handled by the
         // plugin that marked it with \0
@@ -278,7 +268,11 @@ export async function fileToUrl(
   }
 }
 
-function fileToDevUrl(id: string, config: ResolvedConfig) {
+export function fileToDevUrl(
+  id: string,
+  config: ResolvedConfig,
+  skipBase = false,
+): string {
   let rtn: string
   if (checkPublicFile(id, config)) {
     // in public dir during dev, keep the url as-is
@@ -291,7 +285,10 @@ function fileToDevUrl(id: string, config: ResolvedConfig) {
     // (this is special handled by the serve static middleware
     rtn = path.posix.join(FS_PREFIX, id)
   }
-  const base = joinUrlSegments(config.server?.origin ?? '', config.base)
+  if (skipBase) {
+    return rtn
+  }
+  const base = joinUrlSegments(config.server?.origin ?? '', config.decodedBase)
   return joinUrlSegments(base, removeLeadingSlash(rtn))
 }
 
@@ -316,7 +313,7 @@ export function publicFileToBuiltUrl(
 ): string {
   if (config.command !== 'build') {
     // We don't need relative base or renderBuiltUrl support during dev
-    return joinUrlSegments(config.base, url)
+    return joinUrlSegments(config.decodedBase, url)
   }
   const hash = getHash(url)
   let cache = publicAssetUrlCache.get(config)
@@ -381,17 +378,17 @@ async function fileToBuiltUrl(
     const { search, hash } = parseUrl(id)
     const postfix = (search || '') + (hash || '')
 
+    const originalFileName = normalizePath(path.relative(config.root, file))
     const referenceId = pluginContext.emitFile({
+      type: 'asset',
       // Ignore directory structure for asset file names
       name: path.basename(file),
-      type: 'asset',
+      originalFileName,
       source: content,
     })
+    generatedAssets.get(config)!.set(referenceId, { originalFileName })
 
-    const originalName = normalizePath(path.relative(config.root, file))
-    generatedAssets.get(config)!.set(referenceId, { originalName })
-
-    url = `__VITE_ASSET__${referenceId}__${postfix ? `$_${postfix}__` : ``}` // TODO_BASE
+    url = `__VITE_ASSET__${referenceId}__${postfix ? `$_${postfix}__` : ``}`
   }
 
   cache.set(id, url)

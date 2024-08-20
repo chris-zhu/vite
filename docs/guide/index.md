@@ -71,19 +71,26 @@ Then follow the prompts!
 
 You can also directly specify the project name and the template you want to use via additional command line options. For example, to scaffold a Vite + Vue project, run:
 
-```bash
+::: code-group
+
+```bash [NPM]
 # npm 7+, extra double-dash is needed:
-npm create vite@latest my-vue-app -- --template vue
-
-# yarn
-yarn create vite my-vue-app --template vue
-
-# pnpm
-pnpm create vite my-vue-app --template vue
-
-# bun
-bun create vite my-vue-app --template vue
+$ npm create vite@latest my-vue-app -- --template vue
 ```
+
+```bash [Yarn]
+$ yarn create vite my-vue-app --template vue
+```
+
+```bash [PNPM]
+$ pnpm create vite my-vue-app --template vue
+```
+
+```bash [Bun]
+$ bun create vite my-vue-app --template vue
+```
+
+:::
 
 See [create-vite](https://github.com/vitejs/vite/tree/main/packages/create-vite) for more details on each supported template: `vanilla`, `vanilla-ts`, `vue`, `vue-ts`, `react`, `react-ts`, `react-swc`, `react-swc-ts`, `preact`, `preact-ts`, `lit`, `lit-ts`, `svelte`, `svelte-ts`, `solid`, `solid-ts`, `qwik`, `qwik-ts`.
 
@@ -104,6 +111,44 @@ cd my-project
 npm install
 npm run dev
 ```
+
+## Manual Installation
+
+In your project, you can install the `vite` CLI using:
+
+::: code-group
+
+```bash [NPM]
+$ npm install -D vite
+```
+
+```bash [Yarn]
+$ yarn add -D vite
+```
+
+```bash [PNPM]
+$ pnpm add -D vite
+```
+
+```bash [Bun]
+$ bun add -D vite
+```
+
+:::
+
+And create an `index.html` file like this:
+
+```html
+<p>Hello Vite!</p>
+```
+
+Then run the `vite` CLI in your terminal:
+
+```bash
+vite
+```
+
+The `index.html` will be served on `http://localhost:5173`.
 
 ## `index.html` and Project Root
 

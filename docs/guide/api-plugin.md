@@ -399,6 +399,10 @@ Vite plugins can also provide hooks that serve Vite-specific purposes. These hoo
   }
   ```
 
+  ::: warning Note
+  This hook won't be called if you are using a framework that has custom handling of entry files (for example [SvelteKit](https://github.com/sveltejs/kit/discussions/8269#discussioncomment-4509145)).
+  :::
+
 ### `handleHotUpdate`
 
 - **Type:** `(ctx: HmrContext) => Array<ModuleNode> | void | Promise<Array<ModuleNode> | void>`
@@ -428,7 +432,6 @@ Vite plugins can also provide hooks that serve Vite-specific purposes. These hoo
 
     ```js
     handleHotUpdate({ server, modules, timestamp }) {
-      server.ws.send({ type: 'full-reload' })
       // Invalidate modules manually
       const invalidatedModules = new Set()
       for (const mod of modules) {
@@ -439,6 +442,7 @@ Vite plugins can also provide hooks that serve Vite-specific purposes. These hoo
           true
         )
       }
+      server.ws.send({ type: 'full-reload' })
       return []
     }
     ```

@@ -82,7 +82,10 @@ function getWorkerType(raw: string, clean: string, i: number): WorkerType {
   }
 
   const workerOpts = parseWorkerOptions(workerOptString, commaIndex + 1)
-  if (workerOpts.type && ['classic', 'module'].includes(workerOpts.type)) {
+  if (
+    workerOpts.type &&
+    (workerOpts.type === 'module' || workerOpts.type === 'classic')
+  ) {
     return workerOpts.type
   }
 
@@ -168,7 +171,7 @@ export function workerImportMetaUrlPlugin(config: ResolvedConfig): Plugin {
           if (
             isBuild &&
             config.isWorker &&
-            this.getModuleInfo(cleanUrl(file))?.isEntry
+            config.bundleChain.at(-1) === cleanUrl(file)
           ) {
             s.update(expStart, expEnd, 'self.location.href')
           } else {

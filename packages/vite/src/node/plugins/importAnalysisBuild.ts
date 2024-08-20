@@ -26,6 +26,8 @@ type FileDep = {
   runtime: boolean
 }
 
+type VitePreloadErrorEvent = Event & { payload: Error }
+
 /**
  * A flag for injected helpers. This flag will be set to `false` if the output
  * target is not native es - so that injected helper logic can be conditionally
@@ -42,7 +44,7 @@ const preloadMarkerRE = new RegExp(preloadMarker, 'g')
 const dynamicImportPrefixRE = /import\s*\(/
 
 const dynamicImportTreeshakenRE =
-  /(\b(const|let|var)\s+(\{[^}.]+\})\s*=\s*await\s+import\([^)]+\))|(\(\s*await\s+import\([^)]+\)\s*\)(\??\.[^;[\s]+)+)|\bimport\([^)]+\)(\s*\.then\([^{]*?\(\s*\{([^}.]+)\})/g
+  /((?:\bconst\s+|\blet\s+|\bvar\s+|,\s*)(\{[^{}.=]+\})\s*=\s*await\s+import\([^)]+\))|(\(\s*await\s+import\([^)]+\)\s*\)(\??\.[\w$]+))|\bimport\([^)]+\)(\s*\.then\(\s*(?:function\s*)?\(\s*\{([^{}.=]+)\}\))/g
 
 function toRelativePath(filename: string, importer: string) {
   const relPath = path.posix.relative(path.posix.dirname(importer), filename)
@@ -75,7 +77,7 @@ function detectScriptRel() {
 declare const scriptRel: string
 declare const seen: Record<string, boolean>
 function preload(
-  baseModule: () => Promise<{}>,
+  baseModule: () => Promise<unknown>,
   deps?: string[],
   importerUrl?: string,
 ) {
@@ -145,8 +147,9 @@ function preload(
   return promise
     .then(() => baseModule())
     .catch((err) => {
-      const e = new Event('vite:preloadError', { cancelable: true })
-      // @ts-expect-error custom payload
+      const e = new Event('vite:preloadError', {
+        cancelable: true,
+      }) as VitePreloadErrorEvent
       e.payload = err
       window.dispatchEvent(e)
       if (!e.defaultPrevented) {
@@ -163,15 +166,8 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
   const isWorker = config.isWorker
   const insertPreload = !(ssr || !!config.build.lib || isWorker)
 
-  const resolveModulePreloadDependencies =
-    config.build.modulePreload && config.build.modulePreload.resolveDependencies
   const renderBuiltUrl = config.experimental.renderBuiltUrl
-  const customModulePreloadPaths = !!(
-    resolveModulePreloadDependencies || renderBuiltUrl
-  )
   const isRelativeBase = config.base === './' || config.base === ''
-  const optimizeModulePreloadRelativePaths =
-    isRelativeBase && !customModulePreloadPaths
 
   const { modulePreload } = config.build
   const scriptRel =
@@ -179,21 +175,17 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
       ? `'modulepreload'`
       : `(${detectScriptRel.toString()})()`
 
-  // There are three different cases for the preload list format in __vitePreload
+  // There are two different cases for the preload list format in __vitePreload
   //
   // __vitePreload(() => import(asyncChunk), [ ...deps... ])
   //
   // This is maintained to keep backwards compatibility as some users developed plugins
   // using regex over this list to workaround the fact that module preload wasn't
   // configurable.
-  const assetsURL = customModulePreloadPaths
-    ? // If `experimental.renderBuiltUrl` or `build.modulePreload.resolveDependencies` are used
-      // the dependencies are already resolved. To avoid the need for `new URL(dep, import.meta.url)`
-      // a helper `__vitePreloadRelativeDep` is used to resolve from relative paths which can be minimized.
-      `function(dep, importerUrl) { return dep[0] === '.' ? new URL(dep, importerUrl).href : dep }`
-    : optimizeModulePreloadRelativePaths
-      ? // If there isn't custom resolvers affecting the deps list, deps in the list are relative
-        // to the current chunk and are resolved to absolute URL by the __vitePreload helper itself.
+  const assetsURL =
+    renderBuiltUrl || isRelativeBase
+      ? // If `experimental.renderBuiltUrl` is used, the dependencies might be relative to the current chunk.
+        // If relative base is used, the dependencies are relative to the current chunk.
         // The importerUrl is passed as third parameter to __vitePreload in this case
         `function(dep, importerUrl) { return new URL(dep, importerUrl).href }`
       : // If the base isn't relative, then the deps are relative to the projects `outDir` and the base
@@ -252,48 +244,47 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
           /* handle `const {foo} = await import('foo')`
            *
            * match[1]: `const {foo} = await import('foo')`
-           * match[2]: `const`
-           * match[3]: `{foo}`
+           * match[2]: `{foo}`
            * import end: `const {foo} = await import('foo')_`
            *                                               ^
            */
           if (match[1]) {
             dynamicImports[dynamicImportTreeshakenRE.lastIndex] = {
-              declaration: `${match[2]} ${match[3]}`,
-              names: match[3]?.trim(),
+              declaration: `const ${match[2]}`,
+              names: match[2]?.trim(),
             }
             continue
           }
 
           /* handle `(await import('foo')).foo`
            *
-           * match[4]: `(await import('foo')).foo`
-           * match[5]: `.foo`
+           * match[3]: `(await import('foo')).foo`
+           * match[4]: `.foo`
            * import end: `(await import('foo'))`
            *                                  ^
            */
-          if (match[4]) {
-            let names = match[5].match(/\.([^.?]+)/)?.[1] || ''
+          if (match[3]) {
+            let names = /\.([^.?]+)/.exec(match[4])?.[1] || ''
             // avoid `default` keyword error
             if (names === 'default') {
               names = 'default: __vite_default__'
             }
             dynamicImports[
-              dynamicImportTreeshakenRE.lastIndex - match[5]?.length - 1
+              dynamicImportTreeshakenRE.lastIndex - match[4]?.length - 1
             ] = { declaration: `const {${names}}`, names: `{ ${names} }` }
             continue
           }
 
           /* handle `import('foo').then(({foo})=>{})`
            *
-           * match[6]: `.then(({foo}`
-           * match[7]: `foo`
+           * match[5]: `.then(({foo})`
+           * match[6]: `foo`
            * import end: `import('foo').`
            *                           ^
            */
-          const names = match[7]?.trim()
+          const names = match[6]?.trim()
           dynamicImports[
-            dynamicImportTreeshakenRE.lastIndex - match[6]?.length
+            dynamicImportTreeshakenRE.lastIndex - match[5]?.length
           ] = { declaration: `const {${names}}`, names: `{ ${names} }` }
         }
       }
@@ -351,9 +342,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
           str().appendRight(
             expEnd,
             `,${isModernFlag}?${preloadMarker}:void 0${
-              optimizeModulePreloadRelativePaths || customModulePreloadPaths
-                ? ',import.meta.url'
-                : ''
+              renderBuiltUrl || isRelativeBase ? ',import.meta.url' : ''
             })`,
           )
         }
@@ -404,7 +393,9 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
         return
       }
 
-      if (ssr || isWorker) {
+      // If preload is not enabled, we parse through each imports and remove any imports to pure CSS chunks
+      // as they are removed from the bundle
+      if (!insertPreload) {
         const removedPureCssFiles = removedPureCssFilesCache.get(config)
         if (removedPureCssFiles && removedPureCssFiles.size > 0) {
           for (const file in bundle) {
@@ -576,7 +567,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
 
               if (markerStartPos > 0) {
                 // the dep list includes the main chunk, so only need to reload when there are actual other deps.
-                const depsArray =
+                let depsArray =
                   deps.size > 1 ||
                   // main chunk is removed
                   (hasRemovedPureCssChunk && deps.size > 0)
@@ -587,33 +578,29 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
                       : [...deps]
                     : []
 
-                let renderedDeps: number[]
-                if (normalizedFile && customModulePreloadPaths) {
-                  const { modulePreload } = config.build
-                  const resolveDependencies = modulePreload
-                    ? modulePreload.resolveDependencies
-                    : undefined
-                  let resolvedDeps: string[]
-                  if (resolveDependencies) {
-                    // We can't let the user remove css deps as these aren't really preloads, they are just using
-                    // the same mechanism as module preloads for this chunk
-                    const cssDeps: string[] = []
-                    const otherDeps: string[] = []
-                    for (const dep of depsArray) {
-                      ;(dep.endsWith('.css') ? cssDeps : otherDeps).push(dep)
-                    }
-                    resolvedDeps = [
-                      ...resolveDependencies(normalizedFile, otherDeps, {
-                        hostId: file,
-                        hostType: 'js',
-                      }),
-                      ...cssDeps,
-                    ]
-                  } else {
-                    resolvedDeps = depsArray
+                const resolveDependencies = modulePreload
+                  ? modulePreload.resolveDependencies
+                  : undefined
+                if (resolveDependencies && normalizedFile) {
+                  // We can't let the user remove css deps as these aren't really preloads, they are just using
+                  // the same mechanism as module preloads for this chunk
+                  const cssDeps: string[] = []
+                  const otherDeps: string[] = []
+                  for (const dep of depsArray) {
+                    ;(dep.endsWith('.css') ? cssDeps : otherDeps).push(dep)
                   }
+                  depsArray = [
+                    ...resolveDependencies(normalizedFile, otherDeps, {
+                      hostId: file,
+                      hostType: 'js',
+                    }),
+                    ...cssDeps,
+                  ]
+                }
 
-                  renderedDeps = resolvedDeps.map((dep) => {
+                let renderedDeps: number[]
+                if (renderBuiltUrl) {
+                  renderedDeps = depsArray.map((dep) => {
                     const replacement = toOutputFilePathInJS(
                       dep,
                       'asset',
@@ -633,7 +620,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
                   renderedDeps = depsArray.map((d) =>
                     // Don't include the assets dir if the default asset file names
                     // are used, the path will be reconstructed by the import preload helper
-                    optimizeModulePreloadRelativePaths
+                    isRelativeBase
                       ? addFileDep(toRelativePath(d, file))
                       : addFileDep(d),
                   )
@@ -658,7 +645,7 @@ export function buildImportAnalysisPlugin(config: ResolvedConfig): Plugin {
               )
               .join(',')}]`
 
-            const mapDepsCode = `const __vite__fileDeps=${fileDepsCode},__vite__mapDeps=i=>i.map(i=>__vite__fileDeps[i]);\n`
+            const mapDepsCode = `const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=${fileDepsCode})))=>i.map(i=>d[i]);\n`
 
             // inject extra code at the top or next line of hashbang
             if (code.startsWith('#!')) {
